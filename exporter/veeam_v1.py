@@ -166,6 +166,69 @@ class VeeamTaskManager:
             end_time = task.get('endTime', 'N/A')
             print(f"{name:<30} {task_type:<15} {state:<10} {result:<10} {creation_time:<25} {end_time:<25}")
 
+class VeeamBackupObjectsManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+
+    def get_all_backup_objects(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/backupObjects"
+        params = {
+            "skip": "0",
+            "limit": str(limit),
+            "orderColumn": "Name",
+            "orderAsc": "true",
+            **filters
+        }
+        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            raise Exception(f"Failed to get backup objects: {response.status_code} - {response.text}")
+
+    def display_backup_objects(self, **filters):
+        backup_objects = self.get_all_backup_objects(**filters)
+        print(f"{'Name':<30} {'Object ID':<40} {'Platform Name':<15} {'Platform ID':<40} {'Type':<20}")
+        print("-" * 145)
+        for obj in backup_objects:
+            name = obj.get('name', 'N/A')
+            object_id = obj.get('objectId', 'N/A')
+            platform_name = obj.get('platformName', 'N/A')
+            platform_id = obj.get('platformId', 'N/A')
+            obj_type = obj.get('type', 'N/A')
+            print(f"{name:<30} {object_id:<40} {platform_name:<15} {platform_id:<40} {obj_type:<20}")
+
+class VeeamBackupManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+
+    def get_all_backups(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/backups"
+        params = {
+            "skip": "0",
+            "limit": str(limit),
+            "orderColumn": "CreationTime",
+            "orderAsc": "false",
+            **filters
+        }
+        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            raise Exception(f"Failed to get backups: {response.status_code} - {response.text}")
+
+    def display_backups(self, **filters):
+        backups = self.get_all_backups(**filters)
+        print(f"{'Name':<30} {'Creation Time':<25} {'Platform ID':<40} {'Job ID':<40} {'Policy Tag':<20}")
+        print("-" * 155)
+        for backup in backups:
+            name = backup.get('name', 'N/A')
+            creation_time = backup.get('creationTime', 'N/A')
+            platform_id = backup.get('platformId', 'N/A')
+            job_id = backup.get('jobId', 'N/A')
+            policy_tag = backup.get('policyTag', 'N/A')
+            print(f"{name:<30} {creation_time:<25} {platform_id:<40} {job_id:<40} {policy_tag:<20}")
+            
+
 # Usage example:
 if __name__ == "__main__":
     auth = VeeamAuth("https://cdn.veeam.com", "your_username", "your_password")
