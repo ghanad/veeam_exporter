@@ -227,7 +227,37 @@ class VeeamBackupManager:
             job_id = backup.get('jobId', 'N/A')
             policy_tag = backup.get('policyTag', 'N/A')
             print(f"{name:<30} {creation_time:<25} {platform_id:<40} {job_id:<40} {policy_tag:<20}")
-            
+
+class VeeamRepositoryStatesManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+
+    def get_all_repository_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/backupInfrastructure/repositories/states"
+        params = {
+            "skip": "0",
+            "limit": str(limit),
+            "orderColumn": "Name",
+            "orderAsc": "true",
+            **filters
+        }
+        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            raise Exception(f"Failed to get repository states: {response.status_code} - {response.text}")
+
+    def display_repository_states(self, **filters):
+        repository_states = self.get_all_repository_states(**filters)
+        print(f"{'Name':<30} {'Type':<20} {'Capacity (GB)':<15} {'Free (GB)':<15} {'Used (GB)':<15}")
+        print("-" * 95)
+        for state in repository_states:
+            name = state.get('name', 'N/A')
+            repo_type = state.get('type', 'N/A')
+            capacity = state.get('capacityGB', 'N/A')
+            free = state.get('freeGB', 'N/A')
+            used = state.get('usedSpaceGB', 'N/A')
+            print(f"{name:<30} {repo_type:<20} {capacity:<15} {free:<15} {used:<15}")
 
 # Usage example:
 if __name__ == "__main__":
