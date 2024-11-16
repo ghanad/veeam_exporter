@@ -201,6 +201,7 @@ class JobMetricsCollector(MetricsCollector):
         self.job_states_manager = VeeamJobStatesManager(auth)
         self.job_last_result = Gauge('veeam_job_last_result', 'Last result of the job (0: None, 1: Success, 2: Warning, 3: Failed)', ['name', 'type'])
         self.job_last_run = Gauge('veeam_job_last_run', 'Timestamp of the last job run', ['name', 'type'])
+        self.job_next_run = Gauge('veeam_job_next_run', 'Timestamp of the next scheduled job run', ['name', 'type'])
         self.job_status = Gauge('veeam_job_status', 'Current status of the job (1: Running, 2: Inactive, 3: Disabled)', ['name', 'type'])
 
     def collect_metrics(self):
@@ -223,6 +224,21 @@ class JobMetricsCollector(MetricsCollector):
                     except ValueError:
                         logger.error("Failed to parse lastRun timestamp for job %s: %s", name, last_run)
 
+                # Add processing for nextRun
+                next_run = state.get('nextRun', '')
+                logger.info(f'[next run start ++] {state}')
+                if next_run:
+                    try:
+                        parsed_time = parser.parse(next_run)
+                        logger.info(f'[next_run] state: {state} - next run {parsed_time}')
+                        next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
+                        self.job_next_run.labels(name=name, type=job_type).set(next_run_timestamp)
+                    except ValueError:
+                        logger.error("Failed to parse nextRun timestamp for job %s: %s", name, next_run)
+                else:
+                    # If nextRun is null, we set it to 0 to indicate no scheduled run
+                    self.job_next_run.labels(name=name, type=job_type).set(0)
+
                 status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
                 status = status_map.get(state.get('status', 'Inactive'), 2)
                 self.job_status.labels(name=name, type=job_type).set(status)
@@ -230,6 +246,7 @@ class JobMetricsCollector(MetricsCollector):
         except Exception as e:
             logger.error("Error collecting job metrics: %s", str(e))
             raise
+
 
 class VeeamMetricsCollector:
     def __init__(self, auth: VeeamAuth):
@@ -253,9 +270,9 @@ class VeeamMetricsCollector:
 app = Flask(__name__)
 
 # Initialize Veeam auth and metrics collector
-base_url = "https://veeam.com"
-username = "admin"
-password = "password"
+base_url = "https://vbkmgmt.sfz.tsetmc.com:9419"
+username = "prometheus"
+password = "P@ssw0rd"
 
 auth = VeeamAuth(base_url, username, password)
 metrics_collector = VeeamMetricsCollector(auth)
