@@ -226,11 +226,9 @@ class JobMetricsCollector(MetricsCollector):
 
                 # Add processing for nextRun
                 next_run = state.get('nextRun', '')
-                logger.info(f'[next run start ++] {state}')
                 if next_run:
                     try:
                         parsed_time = parser.parse(next_run)
-                        logger.info(f'[next_run] state: {state} - next run {parsed_time}')
                         next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
                         self.job_next_run.labels(name=name, type=job_type).set(next_run_timestamp)
                     except ValueError:
