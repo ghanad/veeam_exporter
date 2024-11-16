@@ -57,10 +57,11 @@ groups:
       description: "Backup job {{ $labels.name }} completed with warnings in its last execution"
 
   - alert: VeeamBackupJobDelayed
-    expr: (time() - veeam_job_last_run) > 86400
+    expr: |
+      (time() - veeam_job_last_run) > (veeam_job_next_run - veeam_job_last_run)
     for: 1m
     labels:
       severity: info
     annotations:
       summary: "Veeam backup job delayed ({{ $labels.name }})"
-      description: "Backup job {{ $labels.name }} hasn't run in over 24 hours. Last run was {{ $value | humanizeDuration }} ago"
+      description: "Backup job {{ $labels.name }} has missed its next scheduled run. Last run was {{ $value | humanizeDuration }} ago"
