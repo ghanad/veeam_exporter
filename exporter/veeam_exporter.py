@@ -47,26 +47,57 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 class VeeamAuth:
-    def __init__(self, base_url: str, username: str, password: str):
+    def __init__(self, base_url: str, username: str, password: str, max_retries: int = 3):
         self.base_url = base_url
         self.username = username
         self.password = password
         self.access_token = None
         self.refresh_token = None
         self.token_expiry = 0
+        self.max_retries = max_retries
+        self.token_refresh_buffer = 300  # 5 minutes buffer before expiry
         logger.info("VeeamAuth initialized for URL: %s", base_url)
 
     def get_token(self) -> str:
-        if self.access_token and time.time() < self.token_expiry:
+        current_time = time.time()
+        
+        if self.access_token and current_time < (self.token_expiry - self.token_refresh_buffer):
             return self.access_token
         elif self.refresh_token:
-            logger.info("Refreshing access token")
-            return self.refresh_access_token()
+            try:
+                return self.refresh_access_token()
+            except Exception as e:
+                logger.warning("Failed to refresh token: %s. Getting new token.", str(e))
+                return self.get_new_token_with_retry()
         else:
-            logger.info("Getting new token")
-            return self.get_new_token()
+            return self.get_new_token_with_retry()
 
-    def get_new_token(self) -> str:
+    def get_new_token_with_retry(self) -> str:
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                self._reset_tokens()  # Reset tokens before trying to get new ones
+                return self._get_new_token()
+            except Exception as e:
+                last_exception = e
+                wait_time = (attempt + 1) * 2  # Exponential backoff
+                logger.warning(
+                    "Attempt %d/%d to get new token failed: %s. Waiting %d seconds...",
+                    attempt + 1, self.max_retries, str(e), wait_time
+                )
+                time.sleep(wait_time)
+        
+        logger.error("Failed to get new token after %d attempts", self.max_retries)
+        raise last_exception
+
+    def _reset_tokens(self):
+        """Reset both access and refresh tokens"""
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expiry = 0
+
+    def _get_new_token(self) -> str:
+        """Internal method to get new token"""
         url = f"{self.base_url}/api/oauth2/token"
         payload = {
             "grant_type": "password",
@@ -87,11 +118,12 @@ class VeeamAuth:
             self.token_expiry = time.time() + data['expires_in']
             logger.info("Successfully obtained new token")
             return self.access_token
-        except Exception as e:
-            logger.error("Failed to get token: %s", str(e))
+        except requests.exceptions.RequestException as e:
+            logger.error("Failed to get new token: %s", str(e))
             raise
 
     def refresh_access_token(self) -> str:
+        """Refresh the access token using the refresh token"""
         url = f"{self.base_url}/api/oauth2/token"
         payload = {
             "grant_type": "refresh_token",
@@ -110,23 +142,41 @@ class VeeamAuth:
             self.token_expiry = time.time() + data['expires_in']
             logger.info("Successfully refreshed token")
             return self.access_token
-        except Exception as e:
-            logger.warning("Failed to refresh token: %s. Trying to get new token.", str(e))
-            return self.get_new_token()
+        except requests.exceptions.RequestException as e:
+            logger.warning("Failed to refresh token: %s. Will try to get new token.", str(e))
+            return self.get_new_token_with_retry()
 
     def make_authenticated_request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
-        url = f"{self.base_url}{endpoint}"
-        headers = kwargs.get('headers', {})
-        headers['Authorization'] = f"Bearer {self.get_token()}"
-        headers['x-api-version'] = "1.1-rev2"
-        kwargs['headers'] = headers
-        try:
-            response = requests.request(method, url, **kwargs, verify=False)
-            response.raise_for_status()
-            return response
-        except Exception as e:
-            logger.error("Request failed for endpoint %s: %s", endpoint, str(e))
-            raise
+        last_exception = None
+        for attempt in range(self.max_retries):
+            try:
+                url = f"{self.base_url}{endpoint}"
+                headers = kwargs.get('headers', {})
+                headers['Authorization'] = f"Bearer {self.get_token()}"
+                headers['x-api-version'] = "1.1-rev2"
+                kwargs['headers'] = headers
+                
+                response = requests.request(method, url, **kwargs, verify=False)
+                
+                if response.status_code == 401:
+                    logger.warning("Received 401 error, clearing tokens and retrying...")
+                    self._reset_tokens()
+                    continue
+                
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.RequestException as e:
+                last_exception = e
+                wait_time = (attempt + 1) * 2
+                logger.warning(
+                    "Attempt %d/%d failed for endpoint %s: %s. Waiting %d seconds...",
+                    attempt + 1, self.max_retries, endpoint, str(e), wait_time
+                )
+                time.sleep(wait_time)
+        
+        logger.error("Failed request after %d attempts", self.max_retries)
+        raise last_exception
 
 class VeeamJobStatesManager:
     def __init__(self, auth: VeeamAuth):
