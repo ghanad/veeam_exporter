@@ -12,6 +12,7 @@ from dateutil import parser
 import pytz
 from flask import Flask, Response
 from logging.handlers import RotatingFileHandler
+from typing import Tuple
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -178,6 +179,56 @@ class VeeamAuth:
         logger.error("Failed request after %d attempts", self.max_retries)
         raise last_exception
 
+class VeeamAvailabilityManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+        self.veeam_up = Gauge('veeam_server_up', 'Indicates if Veeam server is up and accessible (1: up, 0: down)')
+        self.api_up = Gauge('veeam_api_up', 'Indicates if Veeam API is up and accessible (1: up, 0: down)')
+        self._last_api_state = False  # Track last known API state
+        
+    def check_availability(self) -> Tuple[bool, bool]:
+        """
+        Check both Veeam server and API availability
+        Returns: (server_up, api_up)
+        """
+        try:
+            # First check API availability
+            api_response = self.auth.make_authenticated_request(
+                "GET", 
+                "/api/v1/serverInfo", 
+                timeout=10
+            )
+            api_up = api_response.status_code == 200
+            
+            # If API is up, check server info
+            if api_up:
+                server_info = api_response.json()
+                server_up = server_info.get('status', '').lower() == 'running'
+            else:
+                server_up = False
+                
+            self._last_api_state = api_up
+            return server_up, api_up
+            
+        except requests.exceptions.RequestException:
+            self._last_api_state = False
+            return False, False
+        except Exception as e:
+            logger.error(f"Error checking Veeam availability: {str(e)}")
+            self._last_api_state = False
+            return False, False
+            
+    def collect_metrics(self):
+        """Update the availability metrics"""
+        server_up, api_up = self.check_availability()
+        self.veeam_up.set(1 if server_up else 0)
+        self.api_up.set(1 if api_up else 0)
+        logger.info(f"Veeam availability - Server: {'up' if server_up else 'down'}, API: {'up' if api_up else 'down'}")
+
+    def is_api_available(self) -> bool:
+        """Return the current API availability state"""
+        return self._last_api_state
+
 class VeeamJobStatesManager:
     def __init__(self, auth: VeeamAuth):
         self.auth = auth
@@ -220,6 +271,21 @@ class MetricsCollector(ABC):
     @abstractmethod
     def collect_metrics(self):
         pass
+    
+    def safe_collect(self):
+        """Template method for safe metric collection"""
+        try:
+            self.collect_metrics()
+            return True
+        except Exception as e:
+            logger.error(f"Error collecting metrics in {self.__class__.__name__}: {str(e)}")
+            self.reset_metrics()
+            return False
+            
+    @abstractmethod
+    def reset_metrics(self):
+        """Reset metrics to default values when collection fails"""
+        pass
 
 class RepositoryMetricsCollector(MetricsCollector):
     def __init__(self, auth: VeeamAuth):
@@ -227,23 +293,36 @@ class RepositoryMetricsCollector(MetricsCollector):
         self.capacity_gb = Gauge('veeam_repository_capacity_gb', 'Capacity of the repository in GB', ['name', 'type'])
         self.free_gb = Gauge('veeam_repository_free_gb', 'Free space in the repository in GB', ['name', 'type'])
         self.used_gb = Gauge('veeam_repository_used_gb', 'Used space in the repository in GB', ['name', 'type'])
+        self._metric_labels = set()  # Track active metric labels
+
+    def reset_metrics(self):
+        """Reset all repository metrics to 0"""
+        for labels in self._metric_labels:
+            self.capacity_gb.labels(**labels).set(0)
+            self.free_gb.labels(**labels).set(0)
+            self.used_gb.labels(**labels).set(0)
 
     def collect_metrics(self):
         try:
             repository_states = self.repository_states_manager.get_all_repository_states()
+            new_labels = set()
+            
             for state in repository_states:
-                name = state.get('name', 'N/A')
-                repo_type = state.get('type', 'N/A')
-                capacity = state.get('capacityGB', 0)
-                free = state.get('freeGB', 0)
-                used = state.get('usedSpaceGB', 0)
-
-                self.capacity_gb.labels(name=name, type=repo_type).set(capacity)
-                self.free_gb.labels(name=name, type=repo_type).set(free)
-                self.used_gb.labels(name=name, type=repo_type).set(used)
+                labels = {
+                    'name': state.get('name', 'N/A'),
+                    'type': state.get('type', 'N/A')
+                }
+                new_labels.add(frozenset(labels.items()))
+                
+                self.capacity_gb.labels(**labels).set(state.get('capacityGB', 0))
+                self.free_gb.labels(**labels).set(state.get('freeGB', 0))
+                self.used_gb.labels(**labels).set(state.get('usedSpaceGB', 0))
+            
+            self._metric_labels = new_labels
             logger.info("Repository metrics collected successfully")
         except Exception as e:
-            logger.error("Error collecting repository metrics: %s", str(e))
+            logger.error(f"Error collecting repository metrics: {str(e)}")
+            self.reset_metrics()
             raise
 
 class JobMetricsCollector(MetricsCollector):
@@ -253,51 +332,79 @@ class JobMetricsCollector(MetricsCollector):
         self.job_last_run = Gauge('veeam_job_last_run', 'Timestamp of the last job run', ['name', 'type'])
         self.job_next_run = Gauge('veeam_job_next_run', 'Timestamp of the next scheduled job run', ['name', 'type'])
         self.job_status = Gauge('veeam_job_status', 'Current status of the job (1: Running, 2: Inactive, 3: Disabled)', ['name', 'type'])
+        self._metric_labels = set()  # Track active metric labels
+
+    def reset_metrics(self):
+        """Reset all job metrics to 0"""
+        for labels in self._metric_labels:
+            labels_dict = dict(labels)
+            self.job_last_result.labels(**labels_dict).set(0)
+            self.job_last_run.labels(**labels_dict).set(0)
+            self.job_next_run.labels(**labels_dict).set(0)
+            self.job_status.labels(**labels_dict).set(0)
 
     def collect_metrics(self):
         try:
             job_states = self.job_states_manager.get_all_job_states()
+            new_labels = set()
+            
             for state in job_states:
                 name = state.get('name', 'N/A')
                 job_type = state.get('type', 'N/A')
+                labels = {
+                    'name': name,
+                    'type': job_type
+                }
+                new_labels.add(frozenset(labels.items()))
                 
+                # Set last result
                 last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
                 last_result = last_result_map.get(state.get('lastResult', 'None'), 0)
-                self.job_last_result.labels(name=name, type=job_type).set(last_result)
+                self.job_last_result.labels(**labels).set(last_result)
 
+                # Set last run time
                 last_run = state.get('lastRun', '')
                 if last_run:
                     try:
                         parsed_time = parser.parse(last_run)
                         last_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_last_run.labels(name=name, type=job_type).set(last_run_timestamp)
-                    except ValueError:
-                        logger.error("Failed to parse lastRun timestamp for job %s: %s", name, last_run)
+                        self.job_last_run.labels(**labels).set(last_run_timestamp)
+                    except ValueError as e:
+                        logger.error("Failed to parse lastRun timestamp for job %s: %s - %s", name, last_run, str(e))
+                        self.job_last_run.labels(**labels).set(0)
+                else:
+                    self.job_last_run.labels(**labels).set(0)
 
-                # Add processing for nextRun
+                # Set next run time
                 next_run = state.get('nextRun', '')
                 if next_run:
                     try:
                         parsed_time = parser.parse(next_run)
                         next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_next_run.labels(name=name, type=job_type).set(next_run_timestamp)
-                    except ValueError:
-                        logger.error("Failed to parse nextRun timestamp for job %s: %s", name, next_run)
+                        self.job_next_run.labels(**labels).set(next_run_timestamp)
+                    except ValueError as e:
+                        logger.error("Failed to parse nextRun timestamp for job %s: %s - %s", name, next_run, str(e))
+                        self.job_next_run.labels(**labels).set(0)
                 else:
-                    # If nextRun is null, we set it to 0 to indicate no scheduled run
-                    self.job_next_run.labels(name=name, type=job_type).set(0)
+                    self.job_next_run.labels(**labels).set(0)
 
+                # Set job status
                 status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
                 status = status_map.get(state.get('status', 'Inactive'), 2)
-                self.job_status.labels(name=name, type=job_type).set(status)
-            logger.info("Job metrics collected successfully")
+                self.job_status.labels(**labels).set(status)
+            
+            # Update the set of active metric labels
+            self._metric_labels = new_labels
+            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
+            
         except Exception as e:
             logger.error("Error collecting job metrics: %s", str(e))
+            self.reset_metrics()
             raise
-
 
 class VeeamMetricsCollector:
     def __init__(self, auth: VeeamAuth):
+        self.availability_manager = VeeamAvailabilityManager(auth)
         self.collectors = [
             RepositoryMetricsCollector(auth),
             JobMetricsCollector(auth)
@@ -306,21 +413,27 @@ class VeeamMetricsCollector:
 
     def collect_metrics(self):
         logger.info("Starting metrics collection")
-        try:
+        
+        # First check availability
+        self.availability_manager.collect_metrics()
+        
+        # Collect other metrics only if API is available
+        if self.availability_manager.is_api_available():
             for collector in self.collectors:
-                collector.collect_metrics()
-            logger.info("Metrics collection completed successfully")
-        except Exception as e:
-            logger.error("Error collecting metrics: %s", str(e))
-            raise
+                collector.safe_collect()
+        else:
+            logger.warning("Skipping metric collection as API is down")
+            # Reset all metrics when API is down
+            for collector in self.collectors:
+                collector.reset_metrics()
 
 # Create Flask application
 app = Flask(__name__)
 
 # Initialize Veeam auth and metrics collector
-base_url = "https://vbkmgmt.sfz.tsetmc.com:9419"
-username = "prometheus"
-password = "P@ssw0rd"
+base_url = "https://veeam.com:9419"
+username = "admin"
+password = "password"
 
 auth = VeeamAuth(base_url, username, password)
 metrics_collector = VeeamMetricsCollector(auth)
@@ -331,8 +444,9 @@ def metrics():
         metrics_collector.collect_metrics()
         return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
     except Exception as e:
-        logger.error("Error generating metrics: %s", str(e))
-        return Response(f"Error generating metrics: {str(e)}", status=500)
+        logger.error(f"Error generating metrics: {str(e)}")
+        # Even if collection fails, return available metrics
+        return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
 @app.route('/health')
 def health():
