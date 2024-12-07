@@ -114,10 +114,6 @@ To contribute:
 3. Make your changes
 4. Submit a pull request
 
-## License
-
-[Add your license information here]
-
 ## Support
 
 For issues and feature requests, please create an issue on GitHub.
