@@ -343,6 +343,17 @@ class JobMetricsCollector(MetricsCollector):
             self.job_next_run.labels(**labels_dict).set(0)
             self.job_status.labels(**labels_dict).set(0)
 
+    def clear_old_metrics(self, current_jobs: set):
+        """Clear metrics for jobs that no longer exist"""
+        jobs_to_remove = self._metric_labels - current_jobs
+        for labels in jobs_to_remove:
+            labels_dict = dict(labels)
+            self.job_last_result.remove(*labels_dict.values())
+            self.job_last_run.remove(*labels_dict.values())
+            self.job_next_run.remove(*labels_dict.values())
+            self.job_status.remove(*labels_dict.values())
+        self._metric_labels = current_jobs
+
     def collect_metrics(self):
         try:
             job_states = self.job_states_manager.get_all_job_states()
@@ -351,16 +362,17 @@ class JobMetricsCollector(MetricsCollector):
             for state in job_states:
                 name = state.get('name', 'N/A')
                 job_type = state.get('type', 'N/A')
-                labels = {
+                labels = frozenset({
                     'name': name,
                     'type': job_type
-                }
-                new_labels.add(frozenset(labels.items()))
+                }.items())
+                new_labels.add(labels)
+                labels_dict = dict(labels)
                 
                 # Set last result
                 last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
                 last_result = last_result_map.get(state.get('lastResult', 'None'), 0)
-                self.job_last_result.labels(**labels).set(last_result)
+                self.job_last_result.labels(**labels_dict).set(last_result)
 
                 # Set last run time
                 last_run = state.get('lastRun', '')
@@ -368,12 +380,12 @@ class JobMetricsCollector(MetricsCollector):
                     try:
                         parsed_time = parser.parse(last_run)
                         last_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_last_run.labels(**labels).set(last_run_timestamp)
+                        self.job_last_run.labels(**labels_dict).set(last_run_timestamp)
                     except ValueError as e:
                         logger.error("Failed to parse lastRun timestamp for job %s: %s - %s", name, last_run, str(e))
-                        self.job_last_run.labels(**labels).set(0)
+                        self.job_last_run.labels(**labels_dict).set(0)
                 else:
-                    self.job_last_run.labels(**labels).set(0)
+                    self.job_last_run.labels(**labels_dict).set(0)
 
                 # Set next run time
                 next_run = state.get('nextRun', '')
@@ -381,20 +393,20 @@ class JobMetricsCollector(MetricsCollector):
                     try:
                         parsed_time = parser.parse(next_run)
                         next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_next_run.labels(**labels).set(next_run_timestamp)
+                        self.job_next_run.labels(**labels_dict).set(next_run_timestamp)
                     except ValueError as e:
                         logger.error("Failed to parse nextRun timestamp for job %s: %s - %s", name, next_run, str(e))
-                        self.job_next_run.labels(**labels).set(0)
+                        self.job_next_run.labels(**labels_dict).set(0)
                 else:
-                    self.job_next_run.labels(**labels).set(0)
+                    self.job_next_run.labels(**labels_dict).set(0)
 
                 # Set job status
                 status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
                 status = status_map.get(state.get('status', 'Inactive'), 2)
-                self.job_status.labels(**labels).set(status)
+                self.job_status.labels(**labels_dict).set(status)
             
-            # Update the set of active metric labels
-            self._metric_labels = new_labels
+            # Clear metrics for jobs that no longer exist
+            self.clear_old_metrics(new_labels)
             logger.info("Job metrics collected successfully for %d jobs", len(job_states))
             
         except Exception as e:
