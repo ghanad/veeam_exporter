@@ -184,35 +184,45 @@ class VeeamAvailabilityManager:
         self.auth = auth
         self.veeam_up = Gauge('veeam_server_up', 'Indicates if Veeam server is up and accessible (1: up, 0: down)')
         self.api_up = Gauge('veeam_api_up', 'Indicates if Veeam API is up and accessible (1: up, 0: down)')
-        self._last_api_state = False  # Track last known API state
+        self._last_api_state = False
         
+    def check_port(self, host: str, port: int, timeout: int = 5) -> bool:
+        """Check if a port is open"""
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        except Exception as e:
+            logger.error(f"Error checking port {port}: {str(e)}")
+            return False
+            
     def check_availability(self) -> Tuple[bool, bool]:
         """
         Check both Veeam server and API availability
         Returns: (server_up, api_up)
         """
         try:
-            # First check API availability
-            api_response = self.auth.make_authenticated_request(
-                "GET", 
-                "/api/v1/serverInfo", 
-                timeout=10
-            )
-            api_up = api_response.status_code == 200
+            # First check if API port is open
+            api_host = self.auth.base_url.split('://')[1].split(':')[0]
+            api_up = self.check_port(api_host, 9419)
             
-            # If API is up, check server info
+            # If API port is up, try to get a token to verify Veeam server is working
             if api_up:
-                server_info = api_response.json()
-                server_up = server_info.get('status', '').lower() == 'running'
+                try:
+                    self.auth.get_token()
+                    server_up = True
+                except Exception as e:
+                    logger.error(f"Failed to get token: {str(e)}")
+                    server_up = False
             else:
                 server_up = False
                 
             self._last_api_state = api_up
             return server_up, api_up
             
-        except requests.exceptions.RequestException:
-            self._last_api_state = False
-            return False, False
         except Exception as e:
             logger.error(f"Error checking Veeam availability: {str(e)}")
             self._last_api_state = False
