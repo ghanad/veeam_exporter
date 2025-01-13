@@ -47,6 +47,17 @@ console_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+def sanitize_label_value(value: str) -> str:
+    """
+    Clean label values to be prometheus compatible
+    """
+    if value is None:
+        return "none"
+    # Replace any non-alphanumeric character with underscore
+    cleaned = ''.join(c if c.isalnum() else '_' for c in str(value))
+    # Ensure it's not empty
+    return cleaned if cleaned else "none"
+
 class VeeamAuth:
     def __init__(self, base_url: str, username: str, password: str, max_retries: int = 3):
         self.base_url = base_url
@@ -179,6 +190,7 @@ class VeeamAuth:
         logger.error("Failed request after %d attempts", self.max_retries)
         raise last_exception
 
+
 class VeeamAvailabilityManager:
     def __init__(self, auth: VeeamAuth):
         self.auth = auth
@@ -239,44 +251,6 @@ class VeeamAvailabilityManager:
         """Return the current API availability state"""
         return self._last_api_state
 
-class VeeamJobStatesManager:
-    def __init__(self, auth: VeeamAuth):
-        self.auth = auth
-
-    def get_all_job_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
-        endpoint = "/api/v1/jobs/states"
-        params = {
-            "skip": "0",
-            "limit": str(limit),
-            "orderColumn": "Name",
-            "orderAsc": "true",
-            **filters
-        }
-        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
-        if response.status_code == 200:
-            return response.json().get('data', [])
-        else:
-            raise Exception(f"Failed to get job states: {response.status_code} - {response.text}")
-
-class VeeamRepositoryStatesManager:
-    def __init__(self, auth: VeeamAuth):
-        self.auth = auth
-
-    def get_all_repository_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
-        endpoint = "/api/v1/backupInfrastructure/repositories/states"
-        params = {
-            "skip": "0",
-            "limit": str(limit),
-            "orderColumn": "Name",
-            "orderAsc": "true",
-            **filters
-        }
-        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
-        if response.status_code == 200:
-            return response.json().get('data', [])
-        else:
-            raise Exception(f"Failed to get repository states: {response.status_code} - {response.text}")
-
 class MetricsCollector(ABC):
     @abstractmethod
     def collect_metrics(self):
@@ -297,20 +271,253 @@ class MetricsCollector(ABC):
         """Reset metrics to default values when collection fails"""
         pass
 
+class VeeamJobStatesManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+
+    def get_all_job_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/jobs/states"
+        params = {
+            "skip": "0",
+            "limit": str(limit),
+            "orderColumn": "Name",
+            "orderAsc": "true",
+            **filters
+        }
+        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            raise Exception(f"Failed to get job states: {response.status_code} - {response.text}")
+
+    def get_last_session_by_job_id(self, job_id: str) -> Dict[str, Any]:
+        """
+        Get the last session for a specific job
+        """
+        endpoint = "/api/v1/sessions"
+        params = {
+            "jobIdFilter": job_id,
+            "limit": "1",  # only get the last session
+            "orderColumn": "CreationTime",
+            "orderAsc": "false"  # descending order to get the most recent first
+        }
+        try:
+            response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+            if response.status_code == 200:
+                sessions = response.json().get('data', [])
+                if sessions:
+                    logger.debug(f"Found last session for job {job_id}: {sessions[0]}")
+                    return sessions[0]
+                logger.debug(f"No sessions found for job {job_id}")
+                return {}
+            else:
+                logger.error(f"Failed to get sessions for job ID {job_id}: {response.status_code} - {response.text}")
+                return {}
+        except Exception as e:
+            logger.error(f"Error getting last session for job {job_id}: {str(e)}")
+            return {}
+
+class JobMetricsCollector(MetricsCollector):
+    def __init__(self, auth: VeeamAuth):
+        self.job_states_manager = VeeamJobStatesManager(auth)
+        self.job_last_result = Gauge('veeam_job_last_result', 
+                                   'Last result of the job (0: None, 1: Success, 2: Warning, 3: Failed)', 
+                                   ['job_name', 'job_type', 'job_id'])
+        self.job_last_run = Gauge('veeam_job_last_run', 
+                                 'Timestamp of the last job run', 
+                                 ['job_name', 'job_type', 'job_id'])
+        self.job_next_run = Gauge('veeam_job_next_run', 
+                                 'Timestamp of the next scheduled job run', 
+                                 ['job_name', 'job_type', 'job_id'])
+        self.job_status = Gauge('veeam_job_status', 
+                               'Current status of the job (1: Running, 2: Inactive, 3: Disabled)', 
+                               ['job_name', 'job_type', 'job_id'])
+        self.job_duration = Gauge('veeam_job_duration_seconds', 
+                                'Duration of the last job run in seconds', 
+                                ['job_name', 'job_type', 'job_id'])
+        self._metric_labels = set()
+
+    def reset_metrics(self):
+        """Reset all job metrics to 0"""
+        try:
+            for labels in self._metric_labels:
+                labels_dict = dict(labels)
+                self.job_last_result.labels(**labels_dict).set(0)
+                self.job_last_run.labels(**labels_dict).set(0)
+                self.job_next_run.labels(**labels_dict).set(0)
+                self.job_status.labels(**labels_dict).set(0)
+                self.job_duration.labels(**labels_dict).set(0)
+        except Exception as e:
+            logger.error(f"Error in reset_metrics: {str(e)}")
+
+    def collect_metrics(self):
+        try:
+            job_states = self.job_states_manager.get_all_job_states()
+            new_labels = set()
+            
+            for state in job_states:
+                last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
+                if not last_session:
+                    logger.debug(f"Skipping job {state.get('name')} as it has no sessions")
+                    continue
+
+                job_id = sanitize_label_value(state.get('id'))
+                name = sanitize_label_value(state.get('name', 'N/A'))
+                job_type = sanitize_label_value(state.get('type', 'N/A'))
+                
+                labels = frozenset({
+                    'job_name': name,
+                    'job_type': job_type,
+                    'job_id': job_id
+                }.items())
+                new_labels.add(labels)
+                labels_dict = dict(labels)
+
+                # Set basic job metrics...
+                self.set_basic_job_metrics(state, labels_dict)
+                
+                # Get and set job duration from the last session
+                try:
+                    logger.debug(f"Processing duration for job with labels: {labels_dict}")
+                    
+                    # Get the last session directly
+                    last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
+
+                    if last_session:
+                        logger.debug(f"Got last session for job {name}: {last_session}")
+                        # Calculate duration from creationTime and endTime
+                        creation_time = last_session.get('creationTime')
+                        end_time = last_session.get('endTime')
+                        
+                        if creation_time and end_time:
+                            try:
+                                creation_dt = parser.parse(creation_time)
+                                end_dt = parser.parse(end_time)
+                                duration_seconds = int((end_dt - creation_dt).total_seconds())
+                                logger.debug(f"Calculated duration for job {name}: {duration_seconds} seconds")
+                                self.job_duration.labels(**labels_dict).set(duration_seconds)
+                            except Exception as e:
+                                logger.error(f"Error calculating duration for job {name}: {str(e)}")
+                                self.job_duration.labels(**labels_dict).set(0)
+                        else:
+                            logger.debug(f"Setting zero duration for job {name} as times are missing")
+                            self.job_duration.labels(**labels_dict).set(0)
+                     
+######
+                except Exception as e:
+                    logger.error(f"Error getting duration for job {name}: {str(e)}")
+                    logger.debug(f"Setting zero duration for job {name} due to error")
+                    self.job_duration.labels(**labels_dict).set(0)
+            
+            # Clear metrics for jobs that no longer exist
+            self.clear_old_metrics(new_labels)
+            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
+            
+        except Exception as e:
+            logger.error("Error collecting job metrics: %s", str(e))
+            self.reset_metrics()
+            raise
+
+    def set_basic_job_metrics(self, state: Dict[str, Any], labels_dict: Dict[str, str]):
+        """Helper method to set the basic job metrics"""
+        # Set last result
+        last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
+        last_result = last_result_map.get(state.get('lastResult', 'None'), 0)
+        self.job_last_result.labels(**labels_dict).set(last_result)
+
+        # Set last run time
+        last_run = state.get('lastRun', '')
+        if last_run:
+            try:
+                parsed_time = parser.parse(last_run)
+                last_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
+                self.job_last_run.labels(**labels_dict).set(last_run_timestamp)
+            except ValueError as e:
+                logger.error("Failed to parse lastRun timestamp for job %s: %s - %s", 
+                           labels_dict['job_name'], last_run, str(e))
+                self.job_last_run.labels(**labels_dict).set(0)
+        else:
+            self.job_last_run.labels(**labels_dict).set(0)
+
+        # Set next run time
+        next_run = state.get('nextRun', '')
+        if next_run:
+            try:
+                parsed_time = parser.parse(next_run)
+                next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
+                self.job_next_run.labels(**labels_dict).set(next_run_timestamp)
+            except ValueError as e:
+                logger.error("Failed to parse nextRun timestamp for job %s: %s - %s", 
+                           labels_dict['job_name'], next_run, str(e))
+                self.job_next_run.labels(**labels_dict).set(0)
+        else:
+            self.job_next_run.labels(**labels_dict).set(0)
+
+        # Set job status
+        status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
+        status = status_map.get(state.get('status', 'Inactive'), 2)
+        self.job_status.labels(**labels_dict).set(status)
+
+    def clear_old_metrics(self, current_jobs: set):
+        """Clear metrics for jobs that no longer exist"""
+        try:
+            jobs_to_remove = self._metric_labels - current_jobs
+            for labels in jobs_to_remove:
+                labels_dict = dict(labels)
+                self.job_last_result.remove(*[labels_dict[key] for key in ['job_name', 'job_type', 'job_id']])
+                self.job_last_run.remove(*[labels_dict[key] for key in ['job_name', 'job_type', 'job_id']])
+                self.job_next_run.remove(*[labels_dict[key] for key in ['job_name', 'job_type', 'job_id']])
+                self.job_status.remove(*[labels_dict[key] for key in ['job_name', 'job_type', 'job_id']])
+                self.job_duration.remove(*[labels_dict[key] for key in ['job_name', 'job_type', 'job_id']])
+            self._metric_labels = current_jobs
+        except Exception as e:
+            logger.error(f"Error in clear_old_metrics: {str(e)}")
+
+class VeeamRepositoryStatesManager:
+    def __init__(self, auth: VeeamAuth):
+        self.auth = auth
+
+    def get_all_repository_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/backupInfrastructure/repositories/states"
+        params = {
+            "skip": "0",
+            "limit": str(limit),
+            "orderColumn": "Name",
+            "orderAsc": "true",
+            **filters
+        }
+        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
+        if response.status_code == 200:
+            return response.json().get('data', [])
+        else:
+            raise Exception(f"Failed to get repository states: {response.status_code} - {response.text}")
+
+
 class RepositoryMetricsCollector(MetricsCollector):
     def __init__(self, auth: VeeamAuth):
         self.repository_states_manager = VeeamRepositoryStatesManager(auth)
-        self.capacity_gb = Gauge('veeam_repository_capacity_gb', 'Capacity of the repository in GB', ['name', 'type'])
-        self.free_gb = Gauge('veeam_repository_free_gb', 'Free space in the repository in GB', ['name', 'type'])
-        self.used_gb = Gauge('veeam_repository_used_gb', 'Used space in the repository in GB', ['name', 'type'])
-        self._metric_labels = set()  # Track active metric labels
+        self.capacity_gb = Gauge('veeam_repository_capacity_gb', 
+                                'Capacity of the repository in GB', 
+                                ['repo_name', 'repo_type'])  # تغییر نام label ها
+        self.free_gb = Gauge('veeam_repository_free_gb', 
+                             'Free space in the repository in GB', 
+                             ['repo_name', 'repo_type'])
+        self.used_gb = Gauge('veeam_repository_used_gb', 
+                             'Used space in the repository in GB', 
+                             ['repo_name', 'repo_type'])
+        self._metric_labels = set()
 
     def reset_metrics(self):
         """Reset all repository metrics to 0"""
-        for labels in self._metric_labels:
-            self.capacity_gb.labels(**labels).set(0)
-            self.free_gb.labels(**labels).set(0)
-            self.used_gb.labels(**labels).set(0)
+        try:
+            for labels in self._metric_labels:
+                labels_dict = dict(labels)
+                self.capacity_gb.labels(**labels_dict).set(0)
+                self.free_gb.labels(**labels_dict).set(0)
+                self.used_gb.labels(**labels_dict).set(0)
+        except Exception as e:
+            logger.error(f"Error in reset_metrics: {str(e)}")
+
 
     def collect_metrics(self):
         try:
@@ -319,8 +526,8 @@ class RepositoryMetricsCollector(MetricsCollector):
             
             for state in repository_states:
                 labels = {
-                    'name': state.get('name', 'N/A'),
-                    'type': state.get('type', 'N/A')
+                    'repo_name': sanitize_label_value(state.get('name', 'N/A')),
+                    'repo_type': sanitize_label_value(state.get('type', 'N/A'))
                 }
                 new_labels.add(frozenset(labels.items()))
                 
@@ -335,94 +542,6 @@ class RepositoryMetricsCollector(MetricsCollector):
             self.reset_metrics()
             raise
 
-class JobMetricsCollector(MetricsCollector):
-    def __init__(self, auth: VeeamAuth):
-        self.job_states_manager = VeeamJobStatesManager(auth)
-        self.job_last_result = Gauge('veeam_job_last_result', 'Last result of the job (0: None, 1: Success, 2: Warning, 3: Failed)', ['name', 'type'])
-        self.job_last_run = Gauge('veeam_job_last_run', 'Timestamp of the last job run', ['name', 'type'])
-        self.job_next_run = Gauge('veeam_job_next_run', 'Timestamp of the next scheduled job run', ['name', 'type'])
-        self.job_status = Gauge('veeam_job_status', 'Current status of the job (1: Running, 2: Inactive, 3: Disabled)', ['name', 'type'])
-        self._metric_labels = set()  # Track active metric labels
-
-    def reset_metrics(self):
-        """Reset all job metrics to 0"""
-        for labels in self._metric_labels:
-            labels_dict = dict(labels)
-            self.job_last_result.labels(**labels_dict).set(0)
-            self.job_last_run.labels(**labels_dict).set(0)
-            self.job_next_run.labels(**labels_dict).set(0)
-            self.job_status.labels(**labels_dict).set(0)
-
-    def clear_old_metrics(self, current_jobs: set):
-        """Clear metrics for jobs that no longer exist"""
-        jobs_to_remove = self._metric_labels - current_jobs
-        for labels in jobs_to_remove:
-            labels_dict = dict(labels)
-            self.job_last_result.remove(*labels_dict.values())
-            self.job_last_run.remove(*labels_dict.values())
-            self.job_next_run.remove(*labels_dict.values())
-            self.job_status.remove(*labels_dict.values())
-        self._metric_labels = current_jobs
-
-    def collect_metrics(self):
-        try:
-            job_states = self.job_states_manager.get_all_job_states()
-            new_labels = set()
-            
-            for state in job_states:
-                name = state.get('name', 'N/A')
-                job_type = state.get('type', 'N/A')
-                labels = frozenset({
-                    'name': name,
-                    'type': job_type
-                }.items())
-                new_labels.add(labels)
-                labels_dict = dict(labels)
-                
-                # Set last result
-                last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
-                last_result = last_result_map.get(state.get('lastResult', 'None'), 0)
-                self.job_last_result.labels(**labels_dict).set(last_result)
-
-                # Set last run time
-                last_run = state.get('lastRun', '')
-                if last_run:
-                    try:
-                        parsed_time = parser.parse(last_run)
-                        last_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_last_run.labels(**labels_dict).set(last_run_timestamp)
-                    except ValueError as e:
-                        logger.error("Failed to parse lastRun timestamp for job %s: %s - %s", name, last_run, str(e))
-                        self.job_last_run.labels(**labels_dict).set(0)
-                else:
-                    self.job_last_run.labels(**labels_dict).set(0)
-
-                # Set next run time
-                next_run = state.get('nextRun', '')
-                if next_run:
-                    try:
-                        parsed_time = parser.parse(next_run)
-                        next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                        self.job_next_run.labels(**labels_dict).set(next_run_timestamp)
-                    except ValueError as e:
-                        logger.error("Failed to parse nextRun timestamp for job %s: %s - %s", name, next_run, str(e))
-                        self.job_next_run.labels(**labels_dict).set(0)
-                else:
-                    self.job_next_run.labels(**labels_dict).set(0)
-
-                # Set job status
-                status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
-                status = status_map.get(state.get('status', 'Inactive'), 2)
-                self.job_status.labels(**labels_dict).set(status)
-            
-            # Clear metrics for jobs that no longer exist
-            self.clear_old_metrics(new_labels)
-            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
-            
-        except Exception as e:
-            logger.error("Error collecting job metrics: %s", str(e))
-            self.reset_metrics()
-            raise
 
 class VeeamMetricsCollector:
     def __init__(self, auth: VeeamAuth):
@@ -455,7 +574,7 @@ app = Flask(__name__)
 # Initialize Veeam auth and metrics collector
 base_url = "https://veeam.com:9419"
 username = "admin"
-password = "password"
+password = "admin"
 
 auth = VeeamAuth(base_url, username, password)
 metrics_collector = VeeamMetricsCollector(auth)
@@ -479,4 +598,4 @@ application = app
 
 if __name__ == '__main__':
     # For development only
-    app.run(host='0.0.0.0', port=8000)
+    app.run(host='0.0.0.0', port=8001)
