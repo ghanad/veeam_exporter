@@ -119,7 +119,7 @@ class VeeamAuth:
         }
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "x-api-version": "1.1-rev2"
+            "x-api-version": "1.2-rev0"
         }
         try:
             response = requests.post(url, data=payload, headers=headers, verify=False)
@@ -143,7 +143,7 @@ class VeeamAuth:
         }
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "x-api-version": "1.1-rev2"
+            "x-api-version": "1.2-rev0"
         }
         try:
             response = requests.post(url, data=payload, headers=headers, verify=False)
@@ -165,7 +165,7 @@ class VeeamAuth:
                 url = f"{self.base_url}{endpoint}"
                 headers = kwargs.get('headers', {})
                 headers['Authorization'] = f"Bearer {self.get_token()}"
-                headers['x-api-version'] = "1.1-rev2"
+                headers['x-api-version'] = "1.2-rev0"
                 kwargs['headers'] = headers
                 
                 response = requests.request(method, url, **kwargs, verify=False)
@@ -320,6 +320,7 @@ class VeeamJobStatesManager:
 class JobMetricsCollector(MetricsCollector):
     def __init__(self, auth: VeeamAuth):
         self.job_states_manager = VeeamJobStatesManager(auth)
+        # Existing metrics
         self.job_last_result = Gauge('veeam_job_last_result', 
                                    'Last result of the job (0: None, 1: Success, 2: Warning, 3: Failed)', 
                                    ['job_name', 'job_type', 'job_id'])
@@ -332,9 +333,52 @@ class JobMetricsCollector(MetricsCollector):
         self.job_status = Gauge('veeam_job_status', 
                                'Current status of the job (1: Running, 2: Inactive, 3: Disabled)', 
                                ['job_name', 'job_type', 'job_id'])
-        self.job_duration = Gauge('veeam_job_duration_seconds', 
-                                'Duration of the last job run in seconds', 
-                                ['job_name', 'job_type', 'job_id'])
+        
+        # New timing metrics
+        self.job_start_time = Gauge('veeam_job_start_time',
+                                   'Start time of the last job run',
+                                   ['job_name', 'job_type', 'job_id'])
+        self.job_end_time = Gauge('veeam_job_end_time',
+                                 'End time of the last job run',
+                                 ['job_name', 'job_type', 'job_id'])
+        self.job_duration_seconds = Gauge('veeam_job_duration_seconds',
+                                        'Duration of the last job run in seconds',
+                                        ['job_name', 'job_type', 'job_id'])
+        
+        # New data processing metrics
+        self.job_processed_data_size = Gauge('veeam_job_processed_data_size',
+                                           'Amount of processed data in bytes',
+                                           ['job_name', 'job_type', 'job_id'])
+        self.job_transferred_data_size = Gauge('veeam_job_transferred_data_size',
+                                             'Amount of transferred data in bytes',
+                                             ['job_name', 'job_type', 'job_id'])
+        self.job_backup_size = Gauge('veeam_job_backup_size',
+                                   'Size of the backup in bytes',
+                                   ['job_name', 'job_type', 'job_id'])
+        self.job_deduplication_ratio = Gauge('veeam_job_deduplication_ratio',
+                                           'Deduplication ratio of the backup',
+                                           ['job_name', 'job_type', 'job_id'])
+        self.job_compression_ratio = Gauge('veeam_job_compression_ratio',
+                                         'Compression ratio of the backup',
+                                         ['job_name', 'job_type', 'job_id'])
+        
+        # New object metrics
+        self.job_objects_total = Gauge('veeam_job_objects_total',
+                                     'Total number of objects in the job',
+                                     ['job_name', 'job_type', 'job_id'])
+        self.job_objects_processed = Gauge('veeam_job_objects_processed',
+                                         'Number of processed objects in the last job run',
+                                         ['job_name', 'job_type', 'job_id'])
+        self.job_objects_successful = Gauge('veeam_job_objects_successful',
+                                          'Number of successfully processed objects',
+                                          ['job_name', 'job_type', 'job_id'])
+        self.job_objects_failed = Gauge('veeam_job_objects_failed',
+                                      'Number of failed objects',
+                                      ['job_name', 'job_type', 'job_id'])
+        self.job_objects_warning = Gauge('veeam_job_objects_warning',
+                                       'Number of objects processed with warning',
+                                       ['job_name', 'job_type', 'job_id'])
+        
         self._metric_labels = set()
 
     def reset_metrics(self):
@@ -342,83 +386,34 @@ class JobMetricsCollector(MetricsCollector):
         try:
             for labels in self._metric_labels:
                 labels_dict = dict(labels)
+                # Reset existing metrics
                 self.job_last_result.labels(**labels_dict).set(0)
                 self.job_last_run.labels(**labels_dict).set(0)
                 self.job_next_run.labels(**labels_dict).set(0)
                 self.job_status.labels(**labels_dict).set(0)
-                self.job_duration.labels(**labels_dict).set(0)
+                
+                # Reset new timing metrics
+                self.job_start_time.labels(**labels_dict).set(0)
+                self.job_end_time.labels(**labels_dict).set(0)
+                self.job_duration_seconds.labels(**labels_dict).set(0)
+                
+                # Reset data processing metrics
+                self.job_processed_data_size.labels(**labels_dict).set(0)
+                self.job_transferred_data_size.labels(**labels_dict).set(0)
+                self.job_backup_size.labels(**labels_dict).set(0)
+                self.job_deduplication_ratio.labels(**labels_dict).set(0)
+                self.job_compression_ratio.labels(**labels_dict).set(0)
+                
+                # Reset object metrics
+                self.job_objects_total.labels(**labels_dict).set(0)
+                self.job_objects_processed.labels(**labels_dict).set(0)
+                self.job_objects_successful.labels(**labels_dict).set(0)
+                self.job_objects_failed.labels(**labels_dict).set(0)
+                self.job_objects_warning.labels(**labels_dict).set(0)
         except Exception as e:
             logger.error(f"Error in reset_metrics: {str(e)}")
 
-    def collect_metrics(self):
-        try:
-            job_states = self.job_states_manager.get_all_job_states()
-            new_labels = set()
-            
-            for state in job_states:
-                last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
-                if not last_session:
-                    logger.debug(f"Skipping job {state.get('name')} as it has no sessions")
-                    continue
-
-                job_id = sanitize_label_value(state.get('id'))
-                name = sanitize_label_value(state.get('name', 'N/A'))
-                job_type = sanitize_label_value(state.get('type', 'N/A'))
-                
-                labels = frozenset({
-                    'job_name': name,
-                    'job_type': job_type,
-                    'job_id': job_id
-                }.items())
-                new_labels.add(labels)
-                labels_dict = dict(labels)
-
-                # Set basic job metrics...
-                self.set_basic_job_metrics(state, labels_dict)
-                
-                # Get and set job duration from the last session
-                try:
-                    logger.debug(f"Processing duration for job with labels: {labels_dict}")
-                    
-                    # Get the last session directly
-                    last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
-
-                    if last_session:
-                        logger.debug(f"Got last session for job {name}: {last_session}")
-                        # Calculate duration from creationTime and endTime
-                        creation_time = last_session.get('creationTime')
-                        end_time = last_session.get('endTime')
-                        
-                        if creation_time and end_time:
-                            try:
-                                creation_dt = parser.parse(creation_time)
-                                end_dt = parser.parse(end_time)
-                                duration_seconds = int((end_dt - creation_dt).total_seconds())
-                                logger.debug(f"Calculated duration for job {name}: {duration_seconds} seconds")
-                                self.job_duration.labels(**labels_dict).set(duration_seconds)
-                            except Exception as e:
-                                logger.error(f"Error calculating duration for job {name}: {str(e)}")
-                                self.job_duration.labels(**labels_dict).set(0)
-                        else:
-                            logger.debug(f"Setting zero duration for job {name} as times are missing")
-                            self.job_duration.labels(**labels_dict).set(0)
-                     
-######
-                except Exception as e:
-                    logger.error(f"Error getting duration for job {name}: {str(e)}")
-                    logger.debug(f"Setting zero duration for job {name} due to error")
-                    self.job_duration.labels(**labels_dict).set(0)
-            
-            # Clear metrics for jobs that no longer exist
-            self.clear_old_metrics(new_labels)
-            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
-            
-        except Exception as e:
-            logger.error("Error collecting job metrics: %s", str(e))
-            self.reset_metrics()
-            raise
-
-    def set_basic_job_metrics(self, state: Dict[str, Any], labels_dict: Dict[str, str]):
+	def set_basic_job_metrics(self, state: Dict[str, Any], labels_dict: Dict[str, str]):
         """Helper method to set the basic job metrics"""
         # Set last result
         last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
@@ -457,6 +452,174 @@ class JobMetricsCollector(MetricsCollector):
         status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
         status = status_map.get(state.get('status', 'Inactive'), 2)
         self.job_status.labels(**labels_dict).set(status)
+
+
+    def get_backup_metrics(self, job_id: str) -> Dict[str, float]:
+        """Get backup related metrics for a job"""
+        try:
+            response = self.job_states_manager.auth.make_authenticated_request(
+                "GET", 
+                "/api/v1/backups",
+                params={"jobIdFilter": job_id}
+            )
+            if response.status_code != 200:
+                return {}
+            
+            backup_data = response.json().get('data', [])
+            if not backup_data:
+                return {}
+                
+            backup_id = backup_data[0].get('id')
+            if not backup_id:
+                return {}
+                
+            # Get backup files details
+            files_response = self.job_states_manager.auth.make_authenticated_request(
+                "GET",
+                f"/api/v1/backups/{backup_id}/backupFiles"
+            )
+            if files_response.status_code != 200:
+                return {}
+                
+            files_data = files_response.json().get('data', [])
+            if not files_data:
+                return {}
+                
+            # Calculate metrics
+            total_backup_size = sum(file.get('backupSize', 0) for file in files_data)
+            dedup_ratio = sum(file.get('dedupRatio', 0) for file in files_data) / len(files_data)
+            compress_ratio = sum(file.get('compressRatio', 0) for file in files_data) / len(files_data)
+            
+            return {
+                'backup_size': total_backup_size,
+                'dedup_ratio': dedup_ratio,
+                'compress_ratio': compress_ratio
+            }
+        except Exception as e:
+            logger.error(f"Error getting backup metrics for job {job_id}: {str(e)}")
+            return {}
+
+    def get_task_session_metrics(self, session_id: str) -> Dict[str, Any]:
+        """Get metrics from task sessions"""
+        try:
+            response = self.job_states_manager.auth.make_authenticated_request(
+                "GET",
+                f"/api/v1/sessions/{session_id}/taskSessions"
+            )
+            if response.status_code != 200:
+                return {}
+                
+            task_sessions = response.json().get('data', [])
+            
+            metrics = {
+                'processed_size': 0,
+                'transferred_size': 0,
+                'objects_processed': 0,
+                'objects_successful': 0,
+                'objects_failed': 0,
+                'objects_warning': 0
+            }
+            
+            for task in task_sessions:
+                if task.get('type') == 'Backup':
+                    # Update data sizes
+                    progress = task.get('progress', {})
+                    metrics['processed_size'] += progress.get('processedSize', 0)
+                    metrics['transferred_size'] += progress.get('transferredSize', 0)
+                    
+                    # Update object counts
+                    metrics['objects_processed'] += 1
+                    result = task.get('result', '')
+                    if result == 'Success':
+                        metrics['objects_successful'] += 1
+                    elif result == 'Failed':
+                        metrics['objects_failed'] += 1
+                    elif result == 'Warning':
+                        metrics['objects_warning'] += 1
+                        
+            return metrics
+        except Exception as e:
+            logger.error(f"Error getting task session metrics for session {session_id}: {str(e)}")
+            return {}
+
+    def collect_metrics(self):
+        try:
+            job_states = self.job_states_manager.get_all_job_states()
+            new_labels = set()
+            
+            for state in job_states:
+                job_id = sanitize_label_value(state.get('id'))
+                name = sanitize_label_value(state.get('name', 'N/A'))
+                job_type = sanitize_label_value(state.get('type', 'N/A'))
+                
+                labels = frozenset({
+                    'job_name': name,
+                    'job_type': job_type,
+                    'job_id': job_id
+                }.items())
+                new_labels.add(labels)
+                labels_dict = dict(labels)
+
+                # Set basic job metrics
+                self.set_basic_job_metrics(state, labels_dict)
+                
+                # Get last session details
+                last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
+                if last_session:
+                    # Set timing metrics
+                    creation_time = last_session.get('creationTime')
+                    end_time = last_session.get('endTime')
+                    
+                    if creation_time:
+                        try:
+                            creation_dt = parser.parse(creation_time)
+                            creation_timestamp = creation_dt.astimezone(pytz.UTC).timestamp()
+                            self.job_start_time.labels(**labels_dict).set(creation_timestamp)
+                        except Exception as e:
+                            logger.error(f"Error parsing creation time for job {name}: {str(e)}")
+                            self.job_start_time.labels(**labels_dict).set(0)
+                    
+                    if end_time:
+                        try:
+                            end_dt = parser.parse(end_time)
+                            end_timestamp = end_dt.astimezone(pytz.UTC).timestamp()
+                            self.job_end_time.labels(**labels_dict).set(end_timestamp)
+                            
+                            if creation_time:
+                                duration_seconds = int((end_dt - creation_dt).total_seconds())
+                                self.job_duration_seconds.labels(**labels_dict).set(duration_seconds)
+                        except Exception as e:
+                            logger.error(f"Error parsing end time for job {name}: {str(e)}")
+                            self.job_end_time.labels(**labels_dict).set(0)
+                            self.job_duration_seconds.labels(**labels_dict).set(0)
+                    
+                    # Get task session metrics
+                    task_metrics = self.get_task_session_metrics(last_session.get('id'))
+                    self.job_processed_data_size.labels(**labels_dict).set(task_metrics.get('processed_size', 0))
+                    self.job_transferred_data_size.labels(**labels_dict).set(task_metrics.get('transferred_size', 0))
+                    self.job_objects_processed.labels(**labels_dict).set(task_metrics.get('objects_processed', 0))
+                    self.job_objects_successful.labels(**labels_dict).set(task_metrics.get('objects_successful', 0))
+                    self.job_objects_failed.labels(**labels_dict).set(task_metrics.get('objects_failed', 0))
+                    self.job_objects_warning.labels(**labels_dict).set(task_metrics.get('objects_warning', 0))
+                
+                # Get backup metrics
+                backup_metrics = self.get_backup_metrics(state.get('id'))
+                self.job_backup_size.labels(**labels_dict).set(backup_metrics.get('backup_size', 0))
+                self.job_deduplication_ratio.labels(**labels_dict).set(backup_metrics.get('dedup_ratio', 0))
+                self.job_compression_ratio.labels(**labels_dict).set(backup_metrics.get('compress_ratio', 0))
+                
+                # Set total objects count
+                self.job_objects_total.labels(**labels_dict).set(state.get('objectsCount', 0))
+            
+            # Clear metrics for jobs that no longer exist
+            self.clear_old_metrics(new_labels)
+            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
+            
+        except Exception as e:
+            logger.error(f"Error collecting job metrics: {str(e)}")
+            self.reset_metrics()
+            raise
+
 
     def clear_old_metrics(self, current_jobs: set):
         """Clear metrics for jobs that no longer exist"""
