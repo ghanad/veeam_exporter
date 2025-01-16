@@ -659,15 +659,38 @@ class VeeamRepositoryStatesManager:
 class RepositoryMetricsCollector(MetricsCollector):
     def __init__(self, auth: VeeamAuth):
         self.repository_states_manager = VeeamRepositoryStatesManager(auth)
+        self.auth = auth
+        
+        # Capacity metrics
         self.capacity_gb = Gauge('veeam_repository_capacity_gb', 
-                                'Capacity of the repository in GB', 
-                                ['repo_name', 'repo_type'])  # تغییر نام label ها
-        self.free_gb = Gauge('veeam_repository_free_gb', 
-                             'Free space in the repository in GB', 
+                               'Total capacity of repository in GB',
+                               ['repo_name', 'repo_type'])
+        self.free_gb = Gauge('veeam_repository_free_gb',
+                            'Free space in repository in GB',
+                            ['repo_name', 'repo_type'])
+        self.used_gb = Gauge('veeam_repository_used_gb',
+                            'Used space in repository in GB',
+                            ['repo_name', 'repo_type'])
+
+        # Status metrics
+        self.is_sealed = Gauge('veeam_repository_is_sealed',
+                             'Indicates if repository is sealed (1: yes, 0: no)',
                              ['repo_name', 'repo_type'])
-        self.used_gb = Gauge('veeam_repository_used_gb', 
-                             'Used space in the repository in GB', 
-                             ['repo_name', 'repo_type'])
+        self.is_immutable = Gauge('veeam_repository_is_immutable',
+                                'Indicates if repository is immutable (1: yes, 0: no)',
+                                ['repo_name', 'repo_type'])
+        self.is_maintenance = Gauge('veeam_repository_is_maintenance',
+                                  'Indicates if repository is in maintenance mode (1: yes, 0: no)',
+                                  ['repo_name', 'repo_type'])
+
+        # Task limit metrics
+        self.task_limit_enabled = Gauge('veeam_repository_task_limit_enabled',
+                                      'Indicates if task limit is enabled (1: yes, 0: no)',
+                                      ['repo_name', 'repo_type'])
+        self.max_task_count = Gauge('veeam_repository_max_task_count',
+                                  'Maximum number of concurrent tasks allowed',
+                                  ['repo_name', 'repo_type'])
+
         self._metric_labels = set()
 
     def reset_metrics(self):
@@ -675,31 +698,96 @@ class RepositoryMetricsCollector(MetricsCollector):
         try:
             for labels in self._metric_labels:
                 labels_dict = dict(labels)
+                # Reset capacity metrics
                 self.capacity_gb.labels(**labels_dict).set(0)
                 self.free_gb.labels(**labels_dict).set(0)
                 self.used_gb.labels(**labels_dict).set(0)
+                # Reset status metrics
+                self.is_sealed.labels(**labels_dict).set(0)
+                self.is_immutable.labels(**labels_dict).set(0)
+                self.is_maintenance.labels(**labels_dict).set(0)
+                # Reset task limit metrics
+                self.task_limit_enabled.labels(**labels_dict).set(0)
+                self.max_task_count.labels(**labels_dict).set(0)
         except Exception as e:
             logger.error(f"Error in reset_metrics: {str(e)}")
 
+    def get_repository_details(self, repo_id: str) -> Dict[str, Any]:
+        """Get detailed information about a specific repository"""
+        try:
+            response = self.auth.make_authenticated_request(
+                "GET",
+                f"/api/v1/backupInfrastructure/repositories/{repo_id}"
+            )
+            if response.status_code == 200:
+                return response.json()
+            logger.error(f"Failed to get repository details for {repo_id}: {response.status_code}")
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting repository details for {repo_id}: {str(e)}")
+            return {}
 
     def collect_metrics(self):
+        """Collect all repository metrics"""
         try:
             repository_states = self.repository_states_manager.get_all_repository_states()
             new_labels = set()
             
             for state in repository_states:
+                repo_id = state.get('id')
+                if not repo_id:
+                    continue
+
                 labels = {
                     'repo_name': sanitize_label_value(state.get('name', 'N/A')),
                     'repo_type': sanitize_label_value(state.get('type', 'N/A'))
                 }
                 new_labels.add(frozenset(labels.items()))
-                
+
+                # Set capacity metrics
                 self.capacity_gb.labels(**labels).set(state.get('capacityGB', 0))
                 self.free_gb.labels(**labels).set(state.get('freeGB', 0))
                 self.used_gb.labels(**labels).set(state.get('usedSpaceGB', 0))
-            
+
+                # Get detailed repository information
+                repo_details = self.get_repository_details(repo_id)
+                repo_type = repo_details.get('type', '')
+
+                # Set sealed status
+                is_sealed = 0
+                if repo_type == 'ExtendableRepository':
+                    perf_tier = repo_details.get('PerformanceTier', {})
+                    if perf_tier.get('sealedMode'):
+                        is_sealed = 1
+                self.is_sealed.labels(**labels).set(is_sealed)
+
+                # Set immutable status
+                is_immutable = 0
+                if repo_type == 'LinuxHardened':
+                    if repo_details.get('makeRecentBackupsImmutableDays', 0) > 0:
+                        is_immutable = 1
+                self.is_immutable.labels(**labels).set(is_immutable)
+
+                # Set maintenance status
+                is_maintenance = 0
+                if repo_type == 'ExtendableRepository':
+                    perf_tier = repo_details.get('PerformanceTier', {})
+                    if perf_tier.get('status') == 'Maintenance':
+                        is_maintenance = 1
+                self.is_maintenance.labels(**labels).set(is_maintenance)
+
+                # Set task limit metrics
+                self.task_limit_enabled.labels(**labels).set(
+                    1 if repo_details.get('taskLimitEnabled') else 0
+                )
+                self.max_task_count.labels(**labels).set(
+                    repo_details.get('maxTaskCount', 0)
+                )
+
+            # Update metric labels
             self._metric_labels = new_labels
             logger.info("Repository metrics collected successfully")
+            
         except Exception as e:
             logger.error(f"Error collecting repository metrics: {str(e)}")
             self.reset_metrics()
