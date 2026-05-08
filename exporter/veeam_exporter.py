@@ -7,7 +7,7 @@ from prometheus_client.core import REGISTRY
 from prometheus_client import Gauge
 import requests
 import urllib3
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from dateutil import parser
 import pytz
 from flask import Flask, Response
@@ -68,6 +68,7 @@ class VeeamAuth:
         self.token_expiry = 0
         self.max_retries = max_retries
         self.token_refresh_buffer = 300  # 5 minutes buffer before expiry
+        self.request_timeout = int(os.getenv('VEEAM_REQUEST_TIMEOUT', '30'))
         logger.info("VeeamAuth initialized for URL: %s", base_url)
 
     def get_token(self) -> str:
@@ -122,7 +123,13 @@ class VeeamAuth:
             "x-api-version": "1.1-rev2"
         }
         try:
-            response = requests.post(url, data=payload, headers=headers, verify=False)
+            response = requests.post(
+                url,
+                data=payload,
+                headers=headers,
+                verify=False,
+                timeout=self.request_timeout
+            )
             response.raise_for_status()
             data = response.json()
             self.access_token = data['access_token']
@@ -146,7 +153,13 @@ class VeeamAuth:
             "x-api-version": "1.1-rev2"
         }
         try:
-            response = requests.post(url, data=payload, headers=headers, verify=False)
+            response = requests.post(
+                url,
+                data=payload,
+                headers=headers,
+                verify=False,
+                timeout=self.request_timeout
+            )
             response.raise_for_status()
             data = response.json()
             self.access_token = data['access_token']
@@ -167,6 +180,7 @@ class VeeamAuth:
                 headers['Authorization'] = f"Bearer {self.get_token()}"
                 headers['x-api-version'] = "1.1-rev2"
                 kwargs['headers'] = headers
+                kwargs.setdefault('timeout', self.request_timeout)
                 
                 response = requests.request(method, url, **kwargs, verify=False)
                 
@@ -274,12 +288,13 @@ class MetricsCollector(ABC):
 class VeeamJobStatesManager:
     def __init__(self, auth: VeeamAuth):
         self.auth = auth
+        self.max_pages = int(os.getenv('VEEAM_MAX_PAGES', '20'))
 
     def _get_paginated_data(self, endpoint: str, limit: int = 100, **params) -> List[Dict[str, Any]]:
         data = []
         skip = 0
 
-        while True:
+        while skip < limit * self.max_pages:
             request_params = {
                 "skip": str(skip),
                 "limit": str(limit),
@@ -296,6 +311,13 @@ class VeeamJobStatesManager:
                 break
             skip += limit
 
+        if skip >= limit * self.max_pages:
+            logger.warning(
+                "Stopped paginating %s after %d pages; increase VEEAM_MAX_PAGES if needed",
+                endpoint,
+                self.max_pages
+            )
+
         return data
 
     def get_all_job_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
@@ -305,16 +327,6 @@ class VeeamJobStatesManager:
             limit,
             orderColumn="Name",
             orderAsc="true",
-            **filters
-        )
-
-    def get_all_sessions(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
-        endpoint = "/api/v1/sessions"
-        return self._get_paginated_data(
-            endpoint,
-            limit,
-            orderColumn="CreationTime",
-            orderAsc="false",
             **filters
         )
 
@@ -366,14 +378,6 @@ class JobMetricsCollector(MetricsCollector):
         self._metric_labels = set()
 
     @staticmethod
-    def _get_first_value(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
-        for key in keys:
-            value = data.get(key)
-            if value not in (None, ''):
-                return value
-        return default
-
-    @staticmethod
     def _normalize_result(result: Any) -> int:
         last_result_map = {'none': 0, 'success': 1, 'warning': 2, 'failed': 3}
         return last_result_map.get(str(result or 'None').lower(), 0)
@@ -407,12 +411,8 @@ class JobMetricsCollector(MetricsCollector):
 
     @staticmethod
     def _calculate_duration_seconds(session: Dict[str, Any], job_name: str) -> int:
-        creation_time = JobMetricsCollector._get_first_value(
-            session, ['creationTime', 'creationTimeUTC', 'startTime', 'startTimeUTC']
-        )
-        end_time = JobMetricsCollector._get_first_value(
-            session, ['endTime', 'endTimeUTC', 'stopTime', 'stopTimeUTC']
-        )
+        creation_time = session.get('creationTime')
+        end_time = session.get('endTime')
 
         if not creation_time or not end_time:
             logger.debug(f"Setting zero duration for job {job_name} as times are missing")
@@ -425,28 +425,6 @@ class JobMetricsCollector(MetricsCollector):
         except Exception as e:
             logger.error(f"Error calculating duration for job {job_name}: {str(e)}")
             return 0
-
-    @staticmethod
-    def _get_session_job_id(session: Dict[str, Any]) -> Any:
-        job_id = JobMetricsCollector._get_first_value(session, ['jobId', 'jobID', 'jobUid', 'jobUID'])
-        if isinstance(job_id, str) and ':' in job_id:
-            return job_id.rsplit(':', 1)[-1]
-        return job_id
-
-    def _session_labels(self, session: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        job_id = self._get_session_job_id(session)
-        name = self._get_first_value(session, ['jobName', 'name'], 'N/A')
-        job_type = self._get_first_value(session, ['jobType', 'type'], 'N/A')
-
-        if not job_id or name == 'N/A':
-            logger.debug(f"Skipping session without usable job identity: {session}")
-            return None
-
-        return {
-            'job_name': sanitize_label_value(name),
-            'job_type': sanitize_label_value(job_type),
-            'job_id': sanitize_label_value(job_id)
-        }
 
     def reset_metrics(self):
         """Reset all job metrics to 0"""
@@ -465,7 +443,6 @@ class JobMetricsCollector(MetricsCollector):
         try:
             job_states = self.job_states_manager.get_all_job_states()
             new_labels = set()
-            seen_job_ids = set()
             
             for state in job_states:
                 last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
@@ -473,7 +450,6 @@ class JobMetricsCollector(MetricsCollector):
                 job_id = sanitize_label_value(state.get('id'))
                 name = sanitize_label_value(state.get('name', 'N/A'))
                 job_type = sanitize_label_value(state.get('type', 'N/A'))
-                seen_job_ids.add(job_id)
                 
                 labels = frozenset({
                     'job_name': name,
@@ -502,15 +478,6 @@ class JobMetricsCollector(MetricsCollector):
                     logger.debug(f"Setting zero duration for job {name} due to error")
                     self.job_duration.labels(**labels_dict).set(0)
 
-            try:
-                sessions = self.job_states_manager.get_all_sessions()
-            except Exception as e:
-                logger.warning(f"Unable to collect fallback session metrics: {str(e)}")
-                sessions = []
-
-            for session in sessions:
-                self.set_session_metrics_if_missing(session, seen_job_ids, new_labels)
-            
             # Clear metrics for jobs that no longer exist
             self.clear_old_metrics(new_labels)
             logger.info("Job metrics collected successfully for %d jobs", len(new_labels))
@@ -519,37 +486,6 @@ class JobMetricsCollector(MetricsCollector):
             logger.error("Error collecting job metrics: %s", str(e))
             self.reset_metrics()
             raise
-
-    def set_session_metrics_if_missing(
-        self,
-        session: Dict[str, Any],
-        seen_job_ids: set,
-        new_labels: set
-    ):
-        """Emit metrics for session-only jobs that are missing from /jobs/states."""
-        labels_dict = self._session_labels(session)
-        if not labels_dict or labels_dict['job_id'] in seen_job_ids:
-            return
-
-        labels = frozenset(labels_dict.items())
-        new_labels.add(labels)
-        seen_job_ids.add(labels_dict['job_id'])
-
-        result = self._get_first_value(session, ['result', 'lastResult'], 'None')
-        state = self._get_first_value(session, ['state', 'status'], 'Inactive')
-        last_run = self._get_first_value(
-            session, ['creationTime', 'creationTimeUTC', 'startTime', 'startTimeUTC']
-        )
-
-        self.job_last_result.labels(**labels_dict).set(self._normalize_result(result))
-        self.job_last_run.labels(**labels_dict).set(
-            self._parse_timestamp(last_run, labels_dict['job_name'], 'lastRun')
-        )
-        self.job_next_run.labels(**labels_dict).set(0)
-        self.job_status.labels(**labels_dict).set(self._normalize_status(state))
-        self.job_duration.labels(**labels_dict).set(
-            self._calculate_duration_seconds(session, labels_dict['job_name'])
-        )
 
     def set_basic_job_metrics(self, state: Dict[str, Any], labels_dict: Dict[str, str]):
         """Helper method to set the basic job metrics"""
@@ -694,9 +630,16 @@ metrics_collector = VeeamMetricsCollector(auth)
 
 @app.route('/metrics')
 def metrics():
+    start_time = time.time()
     try:
         metrics_collector.collect_metrics()
-        return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
+        output = generate_latest(REGISTRY)
+        logger.info(
+            "Generated metrics response in %.2f seconds (%d bytes)",
+            time.time() - start_time,
+            len(output)
+        )
+        return Response(output, mimetype=CONTENT_TYPE_LATEST)
     except Exception as e:
         logger.error(f"Error generating metrics: {str(e)}")
         # Even if collection fails, return available metrics
