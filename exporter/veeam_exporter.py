@@ -7,7 +7,7 @@ from prometheus_client.core import REGISTRY
 from prometheus_client import Gauge
 import requests
 import urllib3
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dateutil import parser
 import pytz
 from flask import Flask, Response
@@ -275,20 +275,48 @@ class VeeamJobStatesManager:
     def __init__(self, auth: VeeamAuth):
         self.auth = auth
 
+    def _get_paginated_data(self, endpoint: str, limit: int = 100, **params) -> List[Dict[str, Any]]:
+        data = []
+        skip = 0
+
+        while True:
+            request_params = {
+                "skip": str(skip),
+                "limit": str(limit),
+                **params
+            }
+            response = self.auth.make_authenticated_request("GET", endpoint, params=request_params)
+            if response.status_code != 200:
+                raise Exception(f"Failed to get data from {endpoint}: {response.status_code} - {response.text}")
+
+            page_data = response.json().get('data', [])
+            data.extend(page_data)
+
+            if len(page_data) < limit:
+                break
+            skip += limit
+
+        return data
+
     def get_all_job_states(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
         endpoint = "/api/v1/jobs/states"
-        params = {
-            "skip": "0",
-            "limit": str(limit),
-            "orderColumn": "Name",
-            "orderAsc": "true",
+        return self._get_paginated_data(
+            endpoint,
+            limit,
+            orderColumn="Name",
+            orderAsc="true",
             **filters
-        }
-        response = self.auth.make_authenticated_request("GET", endpoint, params=params)
-        if response.status_code == 200:
-            return response.json().get('data', [])
-        else:
-            raise Exception(f"Failed to get job states: {response.status_code} - {response.text}")
+        )
+
+    def get_all_sessions(self, limit: int = 100, **filters) -> List[Dict[str, Any]]:
+        endpoint = "/api/v1/sessions"
+        return self._get_paginated_data(
+            endpoint,
+            limit,
+            orderColumn="CreationTime",
+            orderAsc="false",
+            **filters
+        )
 
     def get_last_session_by_job_id(self, job_id: str) -> Dict[str, Any]:
         """
@@ -337,6 +365,89 @@ class JobMetricsCollector(MetricsCollector):
                                 ['job_name', 'job_type', 'job_id'])
         self._metric_labels = set()
 
+    @staticmethod
+    def _get_first_value(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ''):
+                return value
+        return default
+
+    @staticmethod
+    def _normalize_result(result: Any) -> int:
+        last_result_map = {'none': 0, 'success': 1, 'warning': 2, 'failed': 3}
+        return last_result_map.get(str(result or 'None').lower(), 0)
+
+    @staticmethod
+    def _normalize_status(status: Any) -> int:
+        status_map = {
+            'running': 1,
+            'working': 1,
+            'starting': 1,
+            'resuming': 1,
+            'inactive': 2,
+            'stopped': 2,
+            'stopping': 2,
+            'pausing': 2,
+            'disabled': 3
+        }
+        return status_map.get(str(status or 'Inactive').lower(), 2)
+
+    @staticmethod
+    def _parse_timestamp(value: Any, job_name: str, field_name: str) -> float:
+        if not value:
+            return 0
+        try:
+            parsed_time = parser.parse(str(value))
+            return parsed_time.astimezone(pytz.UTC).timestamp()
+        except (ValueError, TypeError) as e:
+            logger.error("Failed to parse %s timestamp for job %s: %s - %s",
+                         field_name, job_name, value, str(e))
+            return 0
+
+    @staticmethod
+    def _calculate_duration_seconds(session: Dict[str, Any], job_name: str) -> int:
+        creation_time = JobMetricsCollector._get_first_value(
+            session, ['creationTime', 'creationTimeUTC', 'startTime', 'startTimeUTC']
+        )
+        end_time = JobMetricsCollector._get_first_value(
+            session, ['endTime', 'endTimeUTC', 'stopTime', 'stopTimeUTC']
+        )
+
+        if not creation_time or not end_time:
+            logger.debug(f"Setting zero duration for job {job_name} as times are missing")
+            return 0
+
+        try:
+            creation_dt = parser.parse(creation_time)
+            end_dt = parser.parse(end_time)
+            return max(0, int((end_dt - creation_dt).total_seconds()))
+        except Exception as e:
+            logger.error(f"Error calculating duration for job {job_name}: {str(e)}")
+            return 0
+
+    @staticmethod
+    def _get_session_job_id(session: Dict[str, Any]) -> Any:
+        job_id = JobMetricsCollector._get_first_value(session, ['jobId', 'jobID', 'jobUid', 'jobUID'])
+        if isinstance(job_id, str) and ':' in job_id:
+            return job_id.rsplit(':', 1)[-1]
+        return job_id
+
+    def _session_labels(self, session: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        job_id = self._get_session_job_id(session)
+        name = self._get_first_value(session, ['jobName', 'name'], 'N/A')
+        job_type = self._get_first_value(session, ['jobType', 'type'], 'N/A')
+
+        if not job_id or name == 'N/A':
+            logger.debug(f"Skipping session without usable job identity: {session}")
+            return None
+
+        return {
+            'job_name': sanitize_label_value(name),
+            'job_type': sanitize_label_value(job_type),
+            'job_id': sanitize_label_value(job_id)
+        }
+
     def reset_metrics(self):
         """Reset all job metrics to 0"""
         try:
@@ -354,16 +465,15 @@ class JobMetricsCollector(MetricsCollector):
         try:
             job_states = self.job_states_manager.get_all_job_states()
             new_labels = set()
+            seen_job_ids = set()
             
             for state in job_states:
                 last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
-                if not last_session:
-                    logger.debug(f"Skipping job {state.get('name')} as it has no sessions")
-                    continue
 
                 job_id = sanitize_label_value(state.get('id'))
                 name = sanitize_label_value(state.get('name', 'N/A'))
                 job_type = sanitize_label_value(state.get('type', 'N/A'))
+                seen_job_ids.add(job_id)
                 
                 labels = frozenset({
                     'job_name': name,
@@ -379,84 +489,87 @@ class JobMetricsCollector(MetricsCollector):
                 # Get and set job duration from the last session
                 try:
                     logger.debug(f"Processing duration for job with labels: {labels_dict}")
-                    
-                    # Get the last session directly
-                    last_session = self.job_states_manager.get_last_session_by_job_id(state.get('id'))
-
                     if last_session:
                         logger.debug(f"Got last session for job {name}: {last_session}")
-                        # Calculate duration from creationTime and endTime
-                        creation_time = last_session.get('creationTime')
-                        end_time = last_session.get('endTime')
-                        
-                        if creation_time and end_time:
-                            try:
-                                creation_dt = parser.parse(creation_time)
-                                end_dt = parser.parse(end_time)
-                                duration_seconds = int((end_dt - creation_dt).total_seconds())
-                                logger.debug(f"Calculated duration for job {name}: {duration_seconds} seconds")
-                                self.job_duration.labels(**labels_dict).set(duration_seconds)
-                            except Exception as e:
-                                logger.error(f"Error calculating duration for job {name}: {str(e)}")
-                                self.job_duration.labels(**labels_dict).set(0)
-                        else:
-                            logger.debug(f"Setting zero duration for job {name} as times are missing")
-                            self.job_duration.labels(**labels_dict).set(0)
-                     
-######
+                        duration_seconds = self._calculate_duration_seconds(last_session, name)
+                        logger.debug(f"Calculated duration for job {name}: {duration_seconds} seconds")
+                        self.job_duration.labels(**labels_dict).set(duration_seconds)
+                    else:
+                        logger.debug(f"Setting zero duration for job {name} as no session was found")
+                        self.job_duration.labels(**labels_dict).set(0)
                 except Exception as e:
                     logger.error(f"Error getting duration for job {name}: {str(e)}")
                     logger.debug(f"Setting zero duration for job {name} due to error")
                     self.job_duration.labels(**labels_dict).set(0)
+
+            try:
+                sessions = self.job_states_manager.get_all_sessions()
+            except Exception as e:
+                logger.warning(f"Unable to collect fallback session metrics: {str(e)}")
+                sessions = []
+
+            for session in sessions:
+                self.set_session_metrics_if_missing(session, seen_job_ids, new_labels)
             
             # Clear metrics for jobs that no longer exist
             self.clear_old_metrics(new_labels)
-            logger.info("Job metrics collected successfully for %d jobs", len(job_states))
+            logger.info("Job metrics collected successfully for %d jobs", len(new_labels))
             
         except Exception as e:
             logger.error("Error collecting job metrics: %s", str(e))
             self.reset_metrics()
             raise
 
+    def set_session_metrics_if_missing(
+        self,
+        session: Dict[str, Any],
+        seen_job_ids: set,
+        new_labels: set
+    ):
+        """Emit metrics for session-only jobs that are missing from /jobs/states."""
+        labels_dict = self._session_labels(session)
+        if not labels_dict or labels_dict['job_id'] in seen_job_ids:
+            return
+
+        labels = frozenset(labels_dict.items())
+        new_labels.add(labels)
+        seen_job_ids.add(labels_dict['job_id'])
+
+        result = self._get_first_value(session, ['result', 'lastResult'], 'None')
+        state = self._get_first_value(session, ['state', 'status'], 'Inactive')
+        last_run = self._get_first_value(
+            session, ['creationTime', 'creationTimeUTC', 'startTime', 'startTimeUTC']
+        )
+
+        self.job_last_result.labels(**labels_dict).set(self._normalize_result(result))
+        self.job_last_run.labels(**labels_dict).set(
+            self._parse_timestamp(last_run, labels_dict['job_name'], 'lastRun')
+        )
+        self.job_next_run.labels(**labels_dict).set(0)
+        self.job_status.labels(**labels_dict).set(self._normalize_status(state))
+        self.job_duration.labels(**labels_dict).set(
+            self._calculate_duration_seconds(session, labels_dict['job_name'])
+        )
+
     def set_basic_job_metrics(self, state: Dict[str, Any], labels_dict: Dict[str, str]):
         """Helper method to set the basic job metrics"""
         # Set last result
-        last_result_map = {'None': 0, 'Success': 1, 'Warning': 2, 'Failed': 3}
-        last_result = last_result_map.get(state.get('lastResult', 'None'), 0)
-        self.job_last_result.labels(**labels_dict).set(last_result)
+        self.job_last_result.labels(**labels_dict).set(self._normalize_result(state.get('lastResult', 'None')))
 
         # Set last run time
         last_run = state.get('lastRun', '')
-        if last_run:
-            try:
-                parsed_time = parser.parse(last_run)
-                last_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                self.job_last_run.labels(**labels_dict).set(last_run_timestamp)
-            except ValueError as e:
-                logger.error("Failed to parse lastRun timestamp for job %s: %s - %s", 
-                           labels_dict['job_name'], last_run, str(e))
-                self.job_last_run.labels(**labels_dict).set(0)
-        else:
-            self.job_last_run.labels(**labels_dict).set(0)
+        self.job_last_run.labels(**labels_dict).set(
+            self._parse_timestamp(last_run, labels_dict['job_name'], 'lastRun')
+        )
 
         # Set next run time
         next_run = state.get('nextRun', '')
-        if next_run:
-            try:
-                parsed_time = parser.parse(next_run)
-                next_run_timestamp = parsed_time.astimezone(pytz.UTC).timestamp()
-                self.job_next_run.labels(**labels_dict).set(next_run_timestamp)
-            except ValueError as e:
-                logger.error("Failed to parse nextRun timestamp for job %s: %s - %s", 
-                           labels_dict['job_name'], next_run, str(e))
-                self.job_next_run.labels(**labels_dict).set(0)
-        else:
-            self.job_next_run.labels(**labels_dict).set(0)
+        self.job_next_run.labels(**labels_dict).set(
+            self._parse_timestamp(next_run, labels_dict['job_name'], 'nextRun')
+        )
 
         # Set job status
-        status_map = {'Running': 1, 'Inactive': 2, 'Disabled': 3}
-        status = status_map.get(state.get('status', 'Inactive'), 2)
-        self.job_status.labels(**labels_dict).set(status)
+        self.job_status.labels(**labels_dict).set(self._normalize_status(state.get('status', 'Inactive')))
 
     def clear_old_metrics(self, current_jobs: set):
         """Clear metrics for jobs that no longer exist"""
