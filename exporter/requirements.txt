@@ -2,3 +2,4 @@ python-dateutil
 pytz
 prometheus_client
 flask
+requests
