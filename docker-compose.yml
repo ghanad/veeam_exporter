@@ -1,0 +1,20 @@
+services:
+  veeam-exporter:
+    build: .
+    image: veeam-exporter:latest
+    container_name: veeam-exporter
+    restart: unless-stopped
+    ports:
+      - "${EXPORTER_PORT:-8001}:${EXPORTER_PORT:-8001}"
+    environment:
+      EXPORTER_PORT: ${EXPORTER_PORT:-8001}
+      VEEAM_BASE_URL: ${VEEAM_BASE_URL:?Set VEEAM_BASE_URL in .env}
+      VEEAM_USERNAME: ${VEEAM_USERNAME:?Set VEEAM_USERNAME in .env}
+      VEEAM_PASSWORD: ${VEEAM_PASSWORD:?Set VEEAM_PASSWORD in .env}
+      VEEAM_REQUEST_TIMEOUT: ${VEEAM_REQUEST_TIMEOUT:-30}
+      VEEAM_MAX_PAGES: ${VEEAM_MAX_PAGES:-20}
+    volumes:
+      - veeam-exporter-logs:/app/exporter/logs
+
+volumes:
+  veeam-exporter-logs:

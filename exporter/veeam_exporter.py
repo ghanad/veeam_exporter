@@ -621,9 +621,9 @@ class VeeamMetricsCollector:
 app = Flask(__name__)
 
 # Initialize Veeam auth and metrics collector
-base_url = "https://veeam.com:9419"
-username = "admin"
-password = "admin"
+base_url = os.getenv("VEEAM_BASE_URL") or "https://veeam.com:9419"
+username = os.getenv("VEEAM_USERNAME") or "admin"
+password = os.getenv("VEEAM_PASSWORD") or "admin"
 
 auth = VeeamAuth(base_url, username, password)
 metrics_collector = VeeamMetricsCollector(auth)
@@ -654,4 +654,4 @@ application = app
 
 if __name__ == '__main__':
     # For development only
-    app.run(host='0.0.0.0', port=8001)
+    app.run(host='0.0.0.0', port=int(os.getenv("EXPORTER_PORT", "8001")))

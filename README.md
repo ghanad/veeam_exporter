@@ -29,7 +29,7 @@ A Prometheus exporter for Veeam Backup & Replication that collects metrics about
 
 ## Prerequisites
 
-- Python 3.6 or higher
+- Python 3.6 or higher, or Docker
 - Veeam Backup & Replication server with API access
 - Access to Veeam server (credentials with appropriate permissions)
 
@@ -43,37 +43,30 @@ cd veeam-exporter
 
 2. Install required packages:
 ```bash
-pip install -r requirements.txt
+pip install -r exporter/requirements.txt
 ```
 
 ## Configuration
 
-Create a `requirements.txt` file with the following dependencies:
-```
-flask
-prometheus_client
-requests
-python-dateutil
-pytz
-```
+Configure the Veeam server connection with environment variables:
 
-Configure the Veeam server connection in the script by modifying these variables:
-```python
-base_url = "https://your-veeam-server:9419"
-username = "your-username"
-password = "your-password"
+```bash
+export VEEAM_BASE_URL="https://your-veeam-server:9419"
+export VEEAM_USERNAME="your-username"
+export VEEAM_PASSWORD="your-password"
+export EXPORTER_PORT=8001
 ```
 
 ## Usage
 
 1. Start the exporter:
 ```bash
-python veeam_exporter.py
+python exporter/veeam_exporter.py
 ```
 
-2. The exporter will start on port 8000 by default. Metrics are available at:
+2. The exporter will start on port 8001 by default. Metrics are available at:
 ```
-http://localhost:8000/metrics
+http://localhost:8001/metrics
 ```
 
 3. Add the target to your Prometheus configuration:
@@ -81,14 +74,44 @@ http://localhost:8000/metrics
 scrape_configs:
   - job_name: 'veeam'
     static_configs:
-      - targets: ['localhost:8000']
+      - targets: ['localhost:8001']
+```
+
+## Docker
+
+1. Create a local environment file:
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and set the Veeam connection details:
+```bash
+VEEAM_BASE_URL=https://your-veeam-server:9419
+VEEAM_USERNAME=your-username
+VEEAM_PASSWORD=your-password
+EXPORTER_PORT=8001
+```
+
+3. Build and start the container:
+```bash
+docker compose up -d --build
+```
+
+Metrics will be available at:
+```
+http://localhost:8001/metrics
+```
+
+Health check:
+```
+http://localhost:8001/health
 ```
 
 ## Health Check
 
 The exporter provides a health check endpoint at:
 ```
-http://localhost:8000/health
+http://localhost:8001/health
 ```
 
 ## Logging
