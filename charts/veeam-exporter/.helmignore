@@ -1,0 +1,9 @@
+.PDS_Store
+.git/
+.gitignore
+.github/
+Dockerfile
+docker-compose.yml
+*.md
+*.log
+tmp/

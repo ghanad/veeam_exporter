@@ -1,0 +1,214 @@
+# Default values for veeam-exporter.
+
+replicaCount: 1
+
+image:
+  # CI publishes the image to Docker Hub as <DOCKERHUB_USERNAME>/veeam-exporter
+  repository: veeam-exporter
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion ("latest")
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  runAsGroup: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8001
+
+exporter:
+  # Port the exporter listens on inside the container (EXPORTER_PORT)
+  port: 8001
+  logLevel: info
+
+veeam:
+  # Veeam Backup & Replication Enterprise Manager API URL (scheme + host + port)
+  baseUrl: https://veeam.example.com:9419
+  requestTimeout: 30
+  maxPages: 20
+  auth:
+    username: admin
+    password: admin
+    # Use an existing secret instead of creating one. Must contain keys
+    # `username` and `password` (configurable below).
+    existingSecret: ""
+    usernameKey: username
+    passwordKey: password
+
+gunicorn:
+  workers: 1
+  timeout: 120
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+resources: {}
+  # limits:
+  #   cpu: 500m
+  #   memory: 256Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+serviceMonitor:
+  enabled: true
+  # Namespace in which to create the ServiceMonitor (defaults to release namespace)
+  namespace: ""
+  # Extra labels for the ServiceMonitor discovery, e.g.
+  #   release: kube-prometheus-stack
+  labels: {}
+  interval: 5m
+  scrapeTimeout: ""
+  path: /metrics
+  honorLabels: false
+  relabelings: []
+  metricRelabelings: []
+
+prometheusRule:
+  enabled: true
+  # Namespace in which to create the PrometheusRule (defaults to release namespace)
+  namespace: ""
+  # Extra labels for Prometheus Operator rule discovery, e.g.
+  #   release: kube-prometheus-stack
+  labels: {}
+
+  # Built-in alerts, keyed by alert name. Each one can be:
+  #   - disabled:            set `enabled: false`
+  #   - customized in place: edit `expr`, `for`, `severity`, `summary`,
+  #                          `description` (or add any other valid rule field,
+  #                          e.g. `keep_firing_for`)
+  defaultRules:
+    VeeamServerDown:
+      enabled: true
+      expr: veeam_server_up != 1
+      for: 1m
+      severity: critical
+      summary: "Veeam backup server is not alive ({{ $labels.instance }})"
+      description: "The Veeam Backup & Replication server is not reachable from the exporter."
+
+    VeeamApiDown:
+      enabled: true
+      expr: veeam_api_up != 1
+      for: 5m
+      severity: critical
+      summary: "Veeam Enterprise Manager API is down ({{ $labels.instance }})"
+      description: "The Veeam Enterprise Manager API has been unreachable for more than 5 minutes."
+
+    VeeamExporterScrapeFailed:
+      enabled: true
+      expr: 'up{job=~".*veeam-exporter"} == 0'
+      for: 10m
+      severity: warning
+      summary: "Veeam exporter scrape failing ({{ $labels.instance }})"
+      description: "Prometheus failed to scrape the Veeam exporter for more than 10 minutes."
+
+    VeeamBackupJobFailed:
+      enabled: true
+      expr: veeam_job_last_result == 3
+      for: 1m
+      severity: critical
+      summary: "Veeam backup job failed ({{ $labels.name }})"
+      description: "Backup job {{ $labels.name }} has failed in its last execution"
+
+    VeeamBackupJobWarning:
+      enabled: true
+      expr: veeam_job_last_result == 2
+      for: 1m
+      severity: warning
+      summary: "Veeam backup job warning ({{ $labels.name }})"
+      description: "Backup job {{ $labels.name }} completed with warnings in its last execution"
+
+    VeeamBackupJobOverdue:
+      enabled: true
+      expr: '(time() - veeam_job_last_run) > 86400'
+      for: 1m
+      severity: warning
+      summary: "Veeam backup job overdue ({{ $labels.name }})"
+      description: "Backup job {{ $labels.name }} hasn't run in over 24 hours. Last run was {{ $value | humanizeDuration }} ago"
+
+    VeeamBackupJobDelayed:
+      enabled: true
+      expr: '(time() - veeam_job_last_run) > (veeam_job_next_run - veeam_job_last_run)'
+      for: 1m
+      severity: info
+      summary: "Veeam backup job delayed ({{ $labels.name }})"
+      description: "Backup job {{ $labels.name }} has missed its next scheduled run. Last run was {{ $value | humanizeDuration }} ago"
+
+    VeeamRepositoryAlmostFull:
+      enabled: true
+      expr: '(veeam_repository_used_gb / veeam_repository_capacity_gb) * 100 > 85'
+      for: 5m
+      severity: critical
+      summary: "Veeam repository almost full ({{ $labels.name }})"
+      description: 'Repository {{ $labels.name }} is {{ $value | printf "%.1f" }}% full'
+
+    VeeamRepositoryHighUsage:
+      enabled: true
+      expr: '(veeam_repository_used_gb / veeam_repository_capacity_gb) * 100 > 70'
+      for: 5m
+      severity: warning
+      summary: "Veeam repository high usage ({{ $labels.name }})"
+      description: 'Repository {{ $labels.name }} is {{ $value | printf "%.1f" }}% full'
+
+  # Additional custom alerts, appended after the built-in ones. Entries are
+  # full Prometheus rule objects, e.g.
+  #
+  #   additionalRules:
+  #     - alert: VeeamRepositoryFreeSpaceLow
+  #       expr: veeam_repository_free_gb < 100
+  #       for: 15m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Low free space on repository {{ $labels.name }}"
+  #
+  additionalRules: []

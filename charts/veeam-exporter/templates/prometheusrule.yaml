@@ -1,0 +1,58 @@
+{{/*
+Render the body of a single alerting rule. Accepts the flattened value
+fields (`severity`, `summary`, `description`) as well as native rule
+fields (`expr`, `for`, `labels`, `annotations`, `keep_firing_for`, ...),
+folding the flattened ones into their canonical locations.
+*/}}
+{{- define "veeam-exporter.prometheusRule.ruleBody" -}}
+{{- $rule := .rule -}}
+{{- $labels := deepCopy (get $rule "labels" | default dict) -}}
+{{- $annotations := deepCopy (get $rule "annotations" | default dict) -}}
+{{- with get $rule "severity" -}}
+{{- $_ := set $labels "severity" . -}}
+{{- end -}}
+{{- with get $rule "summary" -}}
+{{- $_ := set $annotations "summary" . -}}
+{{- end -}}
+{{- with get $rule "description" -}}
+{{- $_ := set $annotations "description" . -}}
+{{- end -}}
+{{- $body := omit $rule "labels" "annotations" "severity" "summary" "description" -}}
+{{- with $labels -}}{{- $_ := set $body "labels" $labels -}}{{- end -}}
+{{- with $annotations -}}{{- $_ := set $body "annotations" $annotations -}}{{- end -}}
+{{- toYaml $body -}}
+{{- end -}}
+
+{{- if .Values.prometheusRule.enabled -}}
+{{- $rules := dict -}}
+{{- range $name, $rule := .Values.prometheusRule.defaultRules -}}
+{{- if kindIs "map" $rule -}}
+{{- if dig "enabled" true $rule -}}
+{{- $_ := set $rules $name (omit $rule "enabled") -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $extra := default list .Values.prometheusRule.additionalRules -}}
+{{- if or $rules $extra }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "veeam-exporter.fullname" . }}
+  labels:
+    {{- include "veeam-exporter.labels" . | nindent 4 }}
+  {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: {{ include "veeam-exporter.fullname" . }}
+      rules:
+      {{- range $name, $rule := $rules }}
+        - alert: {{ $name }}
+          {{- include "veeam-exporter.prometheusRule.ruleBody" (dict "rule" $rule) | nindent 10 }}
+      {{- end }}
+      {{- with $extra }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

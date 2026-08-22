@@ -1,0 +1,22 @@
+apiVersion: v2
+name: veeam-exporter
+description: A Helm chart for deploying the Veeam Backup & Replication Prometheus exporter
+type: application
+keywords:
+  - veeam
+  - prometheus
+  - exporter
+  - monitoring
+  - backup
+home: https://github.com/example/veeam_exporter
+sources:
+  - https://github.com/example/veeam_exporter
+maintainers:
+  - name: veeam-exporter maintainers
+kubeVersion: ">=1.19.0-0"
+version: 0.1.0
+appVersion: "latest"
+annotations:
+  artifacthub.io/images: |
+    - name: veeam-exporter
+      image: veeam-exporter:latest

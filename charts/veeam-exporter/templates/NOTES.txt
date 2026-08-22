@@ -1,0 +1,61 @@
+{{- if not .Values.veeam.auth.existingSecret }}
+
+==========================================================================
+WARNING: The Veeam credentials are set to their defaults.
+==========================================================================
+
+Set them at install time, e.g.:
+
+  helm upgrade --install veeam-exporter charts/veeam-exporter \
+    --set veeam.baseUrl=https://veeam.example.com:9419 \
+    --set veeam.auth.username=admin \
+    --set veeam.auth.password='changeme'
+
+Or reference an existing secret:
+
+  --set veeam.auth.existingSecret=my-veeam-credentials
+
+{{- end }}
+
+The exporter has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+1. Get the application URL by running these commands:
+{{- if contains "NodePort" .Values.service.type }}
+   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "veeam-exporter.fullname" . }})
+   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+   echo http://$NODE_IP:$NODE_PORT/metrics
+{{- else if contains "LoadBalancer" .Values.service.type }}
+     NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+           You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "veeam-exporter.fullname" . }}'
+   export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "veeam-exporter.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+   echo http://$SERVICE_IP:{{ .Values.service.port }}/metrics
+{{- else if contains "ClusterIP" .Values.service.type }}
+   export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "veeam-exporter.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+   echo "Metrics: http://127.0.0.1:8001/metrics"
+   kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8001:{{ .Values.exporter.port }}
+{{- end }}
+
+2. Verify metrics are being collected:
+   curl -s http://127.0.0.1:8001/metrics | grep veeam_
+
+3. Prometheus scraping:
+{{- if .Values.serviceMonitor.enabled }}
+   A ServiceMonitor was created. Make sure your Prometheus Operator selects it,
+   e.g. add matching labels:
+     --set serviceMonitor.labels.release=<prometheus-release-label>
+{{- else }}
+   ServiceMonitor is disabled; configure Prometheus manually to scrape
+   {{ include "veeam-exporter.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}/metrics
+{{- end }}
+
+4. Alerting rules:
+{{- if .Values.prometheusRule.enabled }}
+   A PrometheusRule was created with the built-in Veeam alerts. Individual
+   alerts can be tuned or disabled via prometheusRule.defaultRules.<AlertName>
+   (set any field, or enabled: false), and new ones added via
+   prometheusRule.additionalRules. Ensure your Prometheus Operator selects
+   the rule, e.g.:
+     --set prometheusRule.labels.release=<prometheus-release-label>
+{{- else }}
+   PrometheusRule is disabled.
+{{- end }}
